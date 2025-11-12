@@ -1,0 +1,45 @@
+run:
+  timeout: 5m
+  tests: true
+
+linters:
+  enable:
+    - errcheck
+    - gosimple
+    - govet
+    - ineffassign
+    - staticcheck
+    - typecheck
+    - unused
+    - gofmt
+    - goimports
+    - misspell
+    - revive
+
+linters-settings:
+  revive:
+    rules:
+      - name: exported
+        severity: warning
+        disabled: false
+      - name: package-comments
+        severity: warning
+        disabled: false
+      - name: var-naming
+        severity: warning
+        disabled: false
+      - name: range
+        severity: warning
+        disabled: false
+      - name: increment-decrement
+        severity: warning
+        disabled: false
+      - name: var-declaration
+        severity: warning
+        disabled: false
+
+issues:
+  exclude-use-default: false
+  max-issues-per-linter: 0
+  max-same-issues: 0
+
