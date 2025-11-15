@@ -137,6 +137,15 @@ type Queue interface {
 	CleanupExpiredJobs(ctx context.Context, ttl time.Duration) error
 	ResetRunningJobs(ctx context.Context) error
 
+	// DeleteJobs forcefully deletes jobs by tags and/or job IDs
+	// This method validates that all jobs are in final states (COMPLETED, UNSCHEDULED, STOPPED, UNKNOWN_STOPPED)
+	// before deletion. If any job is not in a final state, an error is returned.
+	// tags: Filter jobs by tags using AND logic (jobs must have ALL provided tags)
+	// jobIDs: Specific job IDs to delete
+	// Both tags and jobIDs are processed (union of both sets)
+	// Returns error if any job is not in a final state or if deletion fails
+	DeleteJobs(ctx context.Context, tags []string, jobIDs []string) error
+
 	Close() error
 }
 
@@ -422,6 +431,13 @@ func (q *PoolQueue) UpdateJobStatus(ctx context.Context, jobID string, status Jo
 // Only completed jobs are deleted; pending and running jobs are never deleted.
 func (q *PoolQueue) CleanupExpiredJobs(ctx context.Context, ttl time.Duration) error {
 	return q.backend.CleanupExpiredJobs(ctx, ttl)
+}
+
+// DeleteJobs forcefully deletes jobs by tags and/or job IDs
+// This method validates that all jobs are in final states (COMPLETED, UNSCHEDULED, STOPPED, UNKNOWN_STOPPED)
+// before deletion. If any job is not in a final state, an error is returned.
+func (q *PoolQueue) DeleteJobs(ctx context.Context, tags []string, jobIDs []string) error {
+	return q.backend.DeleteJobs(ctx, tags, jobIDs)
 }
 
 // GetJob retrieves a job by ID.

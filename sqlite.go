@@ -794,6 +794,116 @@ func (b *SQLiteBackend) CleanupExpiredJobs(ctx context.Context, ttl time.Duratio
 	return nil
 }
 
+// DeleteJobs forcefully deletes jobs by tags and/or job IDs
+// This method validates that all jobs are in final states (COMPLETED, UNSCHEDULED, STOPPED, UNKNOWN_STOPPED)
+// before deletion. If any job is not in a final state, an error is returned.
+func (b *SQLiteBackend) DeleteJobs(ctx context.Context, tags []string, jobIDs []string) error {
+	// Collect all job IDs to delete (union of tag-based and ID-based)
+	jobIDSet := make(map[string]bool)
+
+	// Get job IDs from tags (AND logic)
+	if len(tags) > 0 {
+		query := `
+			SELECT DISTINCT j.id
+			FROM jobs j
+			INNER JOIN job_tags jt ON j.id = jt.job_id
+			WHERE jt.tag IN (` + placeholdersStr(len(tags)) + `)
+			GROUP BY j.id
+			HAVING COUNT(DISTINCT jt.tag) = ?
+		`
+		args := make([]interface{}, 0, len(tags)+1)
+		for _, tag := range tags {
+			args = append(args, tag)
+		}
+		args = append(args, len(tags))
+
+		rows, err := b.db.QueryContext(ctx, query, args...)
+		if err != nil {
+			return fmt.Errorf("failed to query jobs by tags: %w", err)
+		}
+		defer rows.Close()
+
+		for rows.Next() {
+			var jobID string
+			if err := rows.Scan(&jobID); err != nil {
+				return fmt.Errorf("failed to scan job ID: %w", err)
+			}
+			jobIDSet[jobID] = true
+		}
+		if err := rows.Err(); err != nil {
+			return fmt.Errorf("error iterating job IDs: %w", err)
+		}
+	}
+
+	// Add job IDs from the jobIDs parameter
+	for _, jobID := range jobIDs {
+		jobIDSet[jobID] = true
+	}
+
+	if len(jobIDSet) == 0 {
+		return nil
+	}
+
+	// Convert set to slice
+	allJobIDs := make([]string, 0, len(jobIDSet))
+	for jobID := range jobIDSet {
+		allJobIDs = append(allJobIDs, jobID)
+	}
+
+	// Validate all jobs are in final states
+	nonFinalJobs := make([]string, 0)
+	for _, jobID := range allJobIDs {
+		job, err := b.GetJob(ctx, jobID)
+		if err != nil {
+			// Job not found - skip it (not an error for cleanup)
+			continue
+		}
+
+		// Check if job is in a final state
+		if job.Status != JobStatusCompleted &&
+			job.Status != JobStatusUnscheduled &&
+			job.Status != JobStatusStopped &&
+			job.Status != JobStatusUnknownStopped {
+			nonFinalJobs = append(nonFinalJobs, jobID)
+		}
+	}
+
+	// If any job is not in a final state, return error
+	if len(nonFinalJobs) > 0 {
+		return fmt.Errorf("cannot delete jobs: %d job(s) are not in final states (COMPLETED, UNSCHEDULED, STOPPED, UNKNOWN_STOPPED): %v", len(nonFinalJobs), nonFinalJobs)
+	}
+
+	// All jobs are in final states - proceed with deletion
+	// Use transaction to ensure atomicity
+	tx, err := b.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	// Build placeholders for IN clause
+	placeholders := placeholdersStr(len(allJobIDs))
+	args := make([]interface{}, len(allJobIDs))
+	for i, jobID := range allJobIDs {
+		args[i] = jobID
+	}
+
+	// Delete jobs (cascade will handle job_tags table)
+	_, err = tx.ExecContext(ctx, `
+		DELETE FROM jobs
+		WHERE id IN (`+placeholders+`)
+	`, args...)
+	if err != nil {
+		return fmt.Errorf("failed to delete jobs: %w", err)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("failed to commit transaction: %w", err)
+	}
+
+	return nil
+}
+
 // GetJob retrieves a job by ID
 func (b *SQLiteBackend) GetJob(ctx context.Context, jobID string) (*Job, error) {
 	job := &Job{}

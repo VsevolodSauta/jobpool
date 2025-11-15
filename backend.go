@@ -244,6 +244,15 @@ type Backend interface {
 	// CleanupExpiredJobs deletes completed jobs older than TTL
 	CleanupExpiredJobs(ctx context.Context, ttl time.Duration) error
 
+	// DeleteJobs forcefully deletes jobs by tags and/or job IDs
+	// This method validates that all jobs are in final states (COMPLETED, UNSCHEDULED, STOPPED, UNKNOWN_STOPPED)
+	// before deletion. If any job is not in a final state, an error is returned.
+	// tags: Filter jobs by tags using AND logic (jobs must have ALL provided tags)
+	// jobIDs: Specific job IDs to delete
+	// Both tags and jobIDs are processed (union of both sets)
+	// Returns error if any job is not in a final state or if deletion fails
+	DeleteJobs(ctx context.Context, tags []string, jobIDs []string) error
+
 	// Close closes the backend connection
 	Close() error
 }

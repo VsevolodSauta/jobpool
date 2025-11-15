@@ -5,7 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [1.1.0] - 2025-11-15
+
+### Added
+- Forceful job deletion: `DeleteJobs` method for cleanup operations
+  - Validates that all jobs are in final states (COMPLETED, UNSCHEDULED, STOPPED, UNKNOWN_STOPPED) before deletion
+  - Supports deletion by tags (AND logic) and/or job IDs (union of both sets)
+  - Returns error if any job is not in a final state, ensuring data integrity
+  - Available in both `Backend` interface and `Queue` interface
+  - Implemented in both SQLiteBackend and BadgerBackend
+- Comprehensive BDD-style tests using Ginkgo/Gomega:
+  - `delete_test.go`: Tests for forceful job deletion with final state validation
 
 ## [1.0.0] - 2025-11-15
 

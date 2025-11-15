@@ -833,6 +833,162 @@ func (b *BadgerBackend) CleanupExpiredJobs(ctx context.Context, ttl time.Duratio
 	})
 }
 
+// DeleteJobs forcefully deletes jobs by tags and/or job IDs
+// This method validates that all jobs are in final states (COMPLETED, UNSCHEDULED, STOPPED, UNKNOWN_STOPPED)
+// before deletion. If any job is not in a final state, an error is returned.
+func (b *BadgerBackend) DeleteJobs(ctx context.Context, tags []string, jobIDs []string) error {
+	jobIDSet := make(map[string]bool)
+
+	// Collect job IDs from tags (AND logic)
+	if len(tags) > 0 {
+		err := b.db.View(func(txn *badger.Txn) error {
+			// Find jobs that have all tags
+			tagJobSets := make([]map[string]bool, len(tags))
+			for i, tag := range tags {
+				tagJobSets[i] = make(map[string]bool)
+				opts := badger.DefaultIteratorOptions
+				opts.Prefix = []byte(keyPrefixTag + tag + ":")
+				opts.PrefetchValues = false
+
+				it := txn.NewIterator(opts)
+				for it.Rewind(); it.Valid(); it.Next() {
+					key := it.Item().Key()
+					jobID := string(key[len(keyPrefixTag)+len(tag)+1:])
+					tagJobSets[i][jobID] = true
+				}
+				it.Close()
+			}
+
+			// Find intersection (jobs that have all tags)
+			if len(tagJobSets) > 0 {
+				// Start with first tag's jobs
+				for jobID := range tagJobSets[0] {
+					hasAllTags := true
+					for i := 1; i < len(tagJobSets); i++ {
+						if !tagJobSets[i][jobID] {
+							hasAllTags = false
+							break
+						}
+					}
+					if hasAllTags {
+						jobIDSet[jobID] = true
+					}
+				}
+			}
+			return nil
+		})
+		if err != nil {
+			return fmt.Errorf("failed to query jobs by tags: %w", err)
+		}
+	}
+
+	// Add job IDs from the jobIDs parameter
+	for _, jobID := range jobIDs {
+		jobIDSet[jobID] = true
+	}
+
+	if len(jobIDSet) == 0 {
+		return nil
+	}
+
+	// Convert set to slice for validation
+	allJobIDs := make([]string, 0, len(jobIDSet))
+	for jobID := range jobIDSet {
+		allJobIDs = append(allJobIDs, jobID)
+	}
+
+	// Validate all jobs are in final states
+	nonFinalJobs := make([]string, 0)
+	err := b.db.View(func(txn *badger.Txn) error {
+		for _, jobID := range allJobIDs {
+			item, err := txn.Get(jobKey(jobID))
+			if err == badger.ErrKeyNotFound {
+				// Job not found - skip it (not an error for cleanup)
+				continue
+			}
+			if err != nil {
+				return fmt.Errorf("failed to get job %s: %w", jobID, err)
+			}
+
+			jobData, err := item.ValueCopy(nil)
+			if err != nil {
+				return fmt.Errorf("failed to copy job data for %s: %w", jobID, err)
+			}
+
+			var job Job
+			if err := json.Unmarshal(jobData, &job); err != nil {
+				return fmt.Errorf("failed to unmarshal job %s: %w", jobID, err)
+			}
+
+			// Check if job is in a final state
+			if job.Status != JobStatusCompleted &&
+				job.Status != JobStatusUnscheduled &&
+				job.Status != JobStatusStopped &&
+				job.Status != JobStatusUnknownStopped {
+				nonFinalJobs = append(nonFinalJobs, jobID)
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+
+	// If any job is not in a final state, return error
+	if len(nonFinalJobs) > 0 {
+		return fmt.Errorf("cannot delete jobs: %d job(s) are not in final states (COMPLETED, UNSCHEDULED, STOPPED, UNKNOWN_STOPPED): %v", len(nonFinalJobs), nonFinalJobs)
+	}
+
+	// All jobs are in final states - proceed with deletion
+	return b.db.Update(func(txn *badger.Txn) error {
+		for _, jobID := range allJobIDs {
+			// Get job to retrieve tags for index cleanup
+			item, err := txn.Get(jobKey(jobID))
+			if err == badger.ErrKeyNotFound {
+				// Job not found - skip it
+				continue
+			}
+			if err != nil {
+				return fmt.Errorf("failed to get job %s: %w", jobID, err)
+			}
+
+			jobData, err := item.ValueCopy(nil)
+			if err != nil {
+				return fmt.Errorf("failed to copy job data for %s: %w", jobID, err)
+			}
+
+			var job Job
+			if err := json.Unmarshal(jobData, &job); err != nil {
+				return fmt.Errorf("failed to unmarshal job %s: %w", jobID, err)
+			}
+
+			// Delete job
+			if err := txn.Delete(jobKey(jobID)); err != nil {
+				return fmt.Errorf("failed to delete job %s: %w", jobID, err)
+			}
+
+			// Delete tag indexes
+			for _, tag := range job.Tags {
+				_ = txn.Delete(tagKey(tag, jobID))
+			}
+
+			// Delete from pending/running indexes if applicable
+			if job.Status == JobStatusPending || job.Status == JobStatusFailed || job.Status == JobStatusUnknownRetry {
+				timestamp := job.CreatedAt.Unix()
+				if job.LastRetryAt != nil {
+					timestamp = job.LastRetryAt.Unix()
+				}
+				_ = txn.Delete(pendingIndexKey(jobID, timestamp))
+			}
+			if job.Status == JobStatusRunning && job.AssigneeID != "" {
+				_ = txn.Delete(runningIndexKey(job.AssigneeID, jobID))
+			}
+		}
+
+		return nil
+	})
+}
+
 // GetJob retrieves a job by ID
 func (b *BadgerBackend) GetJob(ctx context.Context, jobID string) (*Job, error) {
 	var job *Job
