@@ -7,7 +7,6 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"testing"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -15,11 +14,6 @@ import (
 
 	"github.com/VsevolodSauta/jobpool"
 )
-
-func TestAtomicMethods(t *testing.T) {
-	RegisterFailHandler(Fail)
-	RunSpecs(t, "Atomic Methods Suite")
-}
 
 var _ = Describe("Atomic Job Lifecycle Methods", func() {
 	var (

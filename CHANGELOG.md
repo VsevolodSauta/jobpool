@@ -5,6 +5,27 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.0] - 2025-01-XX
+
+### Added
+- InMemoryBackend implementation for in-memory job storage
+  - Thread-safe in-memory backend suitable for testing and development
+  - Implements full Backend interface with atomic operations
+  - No external dependencies (pure Go, no CGO required)
+  - Comprehensive test coverage using BackendTestSuite
+- Comprehensive test coverage for cancellation flow edge cases:
+  - Test for CANCELLING → STOPPED transition via JobsResultMessage with success=false (verifies retry increment is applied)
+  - Test for cancellation timeout scenario (CANCELLING → UNKNOWN_STOPPED when worker doesn't acknowledge)
+  - Tests for worker response rules validation (workers cannot send both JobsResultMessage and JobCancelledMessage for same job)
+  - Test for job finishing before cancellation is processed (JobsResultMessage first, then JobCancelledMessage)
+  - Test for UNKNOWN_STOPPED → COMPLETED transition
+
+### Fixed
+- Fixed test for FAILED → STOPPED transition to actually test the correct state transition
+  - Previously tested PENDING → UNSCHEDULED instead of FAILED → STOPPED
+  - Now correctly uses backend.UpdateJobStatus to set job to FAILED state before cancellation
+- Removed duplicate/misleading test case that incorrectly suggested CANCELLING → COMPLETED was an invalid transition
+
 ## [1.1.0] - 2025-11-15
 
 ### Added

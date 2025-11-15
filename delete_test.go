@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"os"
 	"strings"
-	"testing"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -16,11 +15,6 @@ import (
 
 	"github.com/VsevolodSauta/jobpool"
 )
-
-func TestJobDeletion(t *testing.T) {
-	RegisterFailHandler(Fail)
-	RunSpecs(t, "Job Deletion Suite")
-}
 
 var _ = Describe("DeleteJobs", func() {
 	var (

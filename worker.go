@@ -21,6 +21,8 @@ type Worker struct {
 	stopCh     chan struct{}
 	doneCh     chan struct{}
 	assigneeID string
+	ctx        context.Context
+	cancel     context.CancelFunc
 }
 
 // NewWorker creates a new worker.
@@ -29,6 +31,7 @@ type Worker struct {
 // config contains worker configuration (TTL, cleanup interval, batch size).
 // assigneeID is a unique identifier for this worker (used for job assignment tracking).
 func NewWorker(queue Queue, processor JobProcessor, config *Config, assigneeID string) *Worker {
+	ctx, cancel := context.WithCancel(context.Background())
 	return &Worker{
 		queue:      queue,
 		processor:  processor,
@@ -36,6 +39,8 @@ func NewWorker(queue Queue, processor JobProcessor, config *Config, assigneeID s
 		stopCh:     make(chan struct{}),
 		doneCh:     make(chan struct{}),
 		assigneeID: assigneeID,
+		ctx:        ctx,
+		cancel:     cancel,
 	}
 }
 
@@ -55,10 +60,10 @@ func (w *Worker) Start(ctx context.Context) error {
 	}
 
 	// Start cleanup goroutine
-	go w.cleanupLoop(ctx)
+	go w.cleanupLoop(w.ctx)
 
 	// Start processing loop
-	go w.processLoop(ctx)
+	go w.processLoop(w.ctx)
 
 	return nil
 }
@@ -69,6 +74,8 @@ func (w *Worker) Start(ctx context.Context) error {
 // Any jobs currently being processed will complete before the worker stops.
 // This method blocks until the worker has fully stopped.
 func (w *Worker) Stop() {
+	// Cancel the context to stop all StreamJobs calls
+	w.cancel()
 	close(w.stopCh)
 	<-w.doneCh
 }
@@ -97,17 +104,36 @@ func (w *Worker) processBatch(ctx context.Context) {
 	jobCh := make(chan []*Job, 1)
 
 	// Start streaming jobs in a goroutine
+	// Use the worker's context so it can be cancelled when Stop() is called
+	// Note: StreamJobs will close the channel when it exits, so we don't close it here
+	streamDone := make(chan struct{})
 	go func() {
-		defer close(jobCh)
-		if err := w.queue.StreamJobs(ctx, w.assigneeID, nil, w.config.BatchSize, jobCh); err != nil {
+		defer close(streamDone)
+		if err := w.queue.StreamJobs(w.ctx, w.assigneeID, nil, w.config.BatchSize, jobCh); err != nil {
 			log.Printf("[Worker] Failed to stream jobs: %v", err)
 		}
 	}()
 
 	// Process jobs from the channel
-	for jobs := range jobCh {
-		for _, job := range jobs {
-			w.processJob(ctx, job)
+	// Exit if context is cancelled or worker is stopped
+	for {
+		select {
+		case <-w.stopCh:
+			// Worker is stopping, wait for StreamJobs to finish
+			<-streamDone
+			return
+		case <-w.ctx.Done():
+			// Context cancelled, wait for StreamJobs to finish
+			<-streamDone
+			return
+		case jobs, ok := <-jobCh:
+			if !ok {
+				// Channel closed by StreamJobs, it finished
+				return
+			}
+			for _, job := range jobs {
+				w.processJob(ctx, job)
+			}
 		}
 	}
 }

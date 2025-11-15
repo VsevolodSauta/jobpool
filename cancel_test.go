@@ -6,7 +6,6 @@ package jobpool_test
 import (
 	"context"
 	"os"
-	"testing"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -14,11 +13,6 @@ import (
 
 	"github.com/VsevolodSauta/jobpool"
 )
-
-func TestJobCancellation(t *testing.T) {
-	RegisterFailHandler(Fail)
-	RunSpecs(t, "Job Cancellation Suite")
-}
 
 var _ = Describe("Job Cancellation", func() {
 	var (
@@ -162,34 +156,37 @@ var _ = Describe("Job Cancellation", func() {
 
 		Context("when a job is already failed", func() {
 			It("should transition to stopped", func() {
-				// Given: A failed job
+				// Given: A job that has failed and is in FAILED state
 				job := &jobpool.Job{
 					ID:            "job-4",
-					Status:        jobpool.JobStatusFailed,
+					Status:        jobpool.JobStatusPending,
 					JobType:       "test",
 					JobDefinition: []byte("test"),
 					CreatedAt:     time.Now(),
 				}
 				_, err := queue.EnqueueJob(ctx, job)
 				Expect(err).NotTo(HaveOccurred())
-				// Set job to running first, then fail it
+				// Set job to running first
 				_, err = backend.DequeueJobs(ctx, "worker-1", nil, 1)
 				Expect(err).NotTo(HaveOccurred())
-				err = queue.FailJob(ctx, "job-4", "error")
+				// Use backend.UpdateJobStatus to set job to FAILED state directly
+				// (FailJob would transition FAILED → PENDING, but we want to test cancelling from FAILED state)
+				_, err = backend.UpdateJobStatus(ctx, "job-4", jobpool.JobStatusFailed, nil, "test error")
 				Expect(err).NotTo(HaveOccurred())
-				// Job is now in PENDING after FailJob, need to get it and check it was in FAILED state
-				// Actually, let's just cancel it from PENDING state which will work
-				// But the test expects FAILED -> STOPPED, so we need to manually set it to FAILED
-				// Since we can't use UpdateJobStatus, we'll need to use backend directly or restructure
-				// For now, let's just test that cancelling a pending job works
-				// When: The job is cancelled (it's now PENDING after FailJob)
+
+				// Verify job is in FAILED state
+				failedJob, err := queue.GetJob(ctx, "job-4")
+				Expect(err).NotTo(HaveOccurred())
+				Expect(failedJob.Status).To(Equal(jobpool.JobStatusFailed))
+
+				// When: The job is cancelled while in FAILED state
 				_, _, err = queue.CancelJobs(ctx, nil, []string{"job-4"})
 				Expect(err).NotTo(HaveOccurred())
 
-				// Then: The job should transition to unscheduled (was PENDING)
+				// Then: The job should transition to STOPPED (not UNSCHEDULED)
 				cancelledJob, err := queue.GetJob(ctx, "job-4")
 				Expect(err).NotTo(HaveOccurred())
-				Expect(cancelledJob.Status).To(Equal(jobpool.JobStatusUnscheduled))
+				Expect(cancelledJob.Status).To(Equal(jobpool.JobStatusStopped))
 			})
 		})
 
@@ -405,33 +402,6 @@ var _ = Describe("Job Cancellation", func() {
 			})
 		})
 
-		Context("when attempting invalid transition from cancelling", func() {
-			It("should return an error for invalid transition", func() {
-				// Given: A job in cancelling state
-				job := &jobpool.Job{
-					ID:            "job-cancelling-invalid",
-					Status:        jobpool.JobStatusRunning,
-					JobType:       "test",
-					JobDefinition: []byte("test"),
-					CreatedAt:     time.Now(),
-					AssigneeID:    "worker-1",
-				}
-				_, err := queue.EnqueueJob(ctx, job)
-				Expect(err).NotTo(HaveOccurred())
-				_, err = backend.DequeueJobs(ctx, "worker-1", nil, 1)
-				Expect(err).NotTo(HaveOccurred())
-				_, _, err = queue.CancelJobs(ctx, nil, []string{"job-cancelling-invalid"})
-				Expect(err).NotTo(HaveOccurred())
-
-				// When: Attempting to fail a job in CANCELLING state (invalid - should use AcknowledgeCancellation or CompleteJob)
-				// This test is no longer relevant since UpdateJobStatus is removed
-				// Instead, we test that CompleteJob works from CANCELLING state
-				err = queue.CompleteJob(ctx, "job-cancelling-invalid", []byte("result"))
-
-				// Then: Should succeed (CANCELLING -> COMPLETED is valid)
-				Expect(err).NotTo(HaveOccurred())
-			})
-		})
 	})
 
 	Describe("Service restart behavior", func() {

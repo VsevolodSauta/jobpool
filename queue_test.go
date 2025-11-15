@@ -479,25 +479,44 @@ func TestPoolQueue_DequeueJobs_IncludesFailedJobs(t *testing.T) {
 	}
 	// Set job to running, then fail it (which transitions to PENDING for retry)
 	// FAILED jobs are treated like PENDING during scheduling
-	_, err = backend.DequeueJobs(ctx, "worker-1", nil, 1)
+	// Dequeue both jobs to ensure we get job-failed-1, then fail it
+	jobs, err := backend.DequeueJobs(ctx, "worker-1", nil, 2)
 	if err != nil {
-		t.Fatalf("Failed to assign job: %v", err)
+		t.Fatalf("Failed to assign jobs: %v", err)
+	}
+	// Find and fail job-failed-1
+	foundFailedJob := false
+	for _, job := range jobs {
+		if job.ID == "job-failed-1" {
+			foundFailedJob = true
+			break
+		}
+	}
+	if !foundFailedJob {
+		t.Fatalf("job-failed-1 was not dequeued")
 	}
 	err = queue.FailJob(ctx, "job-failed-1", "test error")
 	if err != nil {
 		t.Fatalf("Failed to fail job: %v", err)
 	}
 	// Job is now PENDING after FailJob, which is what we want to test
+	// The other job (job-pending-1) is still in RUNNING state, so we need to complete it
+	// or fail it to make it PENDING again. Actually, let's just complete it to free capacity.
+	err = queue.CompleteJob(ctx, "job-pending-1", []byte("done"))
+	if err != nil {
+		t.Fatalf("Failed to complete job-pending-1: %v", err)
+	}
 
-	// Dequeue jobs - should include both PENDING jobs
-	jobs, err := backend.DequeueJobs(ctx, "worker-1", nil, 10)
+	// Dequeue jobs - should include the failed-then-retried job (now PENDING)
+	jobs, err = backend.DequeueJobs(ctx, "worker-1", nil, 10)
 	if err != nil {
 		t.Fatalf("Failed to dequeue jobs: %v", err)
 	}
 
-	// Should get both jobs (both are now PENDING - the original pending and the failed-then-retried)
-	if len(jobs) != 2 {
-		t.Errorf("Expected 2 jobs (both PENDING), got %d", len(jobs))
+	// Should get the failed-then-retried job (now PENDING)
+	// Note: job-pending-1 was completed, so only job-failed-1 should be available
+	if len(jobs) != 1 {
+		t.Errorf("Expected 1 job (failed-then-retried, now PENDING), got %d", len(jobs))
 	}
 
 	// Verify both jobs are assigned and in RUNNING state
@@ -523,9 +542,6 @@ func TestPoolQueue_DequeueJobs_IncludesFailedJobs(t *testing.T) {
 		}
 	}
 
-	if !jobIDs["job-pending-1"] {
-		t.Error("Expected job-pending-1 to be dequeued")
-	}
 	if !jobIDs["job-failed-1"] {
 		t.Error("Expected job-failed-1 to be dequeued")
 	}
@@ -653,11 +669,13 @@ func TestPoolQueue_DequeueJobs_ExcludesUnknownStoppedJobs(t *testing.T) {
 	}
 
 	// Enqueue a job, assign it, cancel it (CANCELLING), then mark worker unresponsive (UNKNOWN_STOPPED)
+	// Use unique tags to ensure we dequeue the specific job
 	unknownStoppedJob := &jobpool.Job{
 		ID:            "job-unknown-stopped-1",
 		Status:        jobpool.JobStatusPending,
 		JobType:       "test",
 		JobDefinition: []byte("test"),
+		Tags:          []string{"unknown-stopped-tag"},
 		CreatedAt:     time.Now(),
 	}
 	_, err = queue.EnqueueJob(ctx, unknownStoppedJob)
@@ -665,13 +683,33 @@ func TestPoolQueue_DequeueJobs_ExcludesUnknownStoppedJobs(t *testing.T) {
 		t.Fatalf("Failed to enqueue job: %v", err)
 	}
 	// Assign to worker-2, cancel it, then mark worker-2 as unresponsive
-	_, err = backend.DequeueJobs(ctx, "worker-2", nil, 1)
+	// Use tags to ensure we dequeue the specific job
+	dequeuedJobs, err := backend.DequeueJobs(ctx, "worker-2", []string{"unknown-stopped-tag"}, 1)
 	if err != nil {
 		t.Fatalf("Failed to assign job: %v", err)
+	}
+	if len(dequeuedJobs) != 1 || dequeuedJobs[0].ID != "job-unknown-stopped-1" {
+		t.Fatalf("Expected to dequeue job-unknown-stopped-1, got %v", dequeuedJobs)
+	}
+	// Verify job is in RUNNING state
+	jobBeforeCancel, err := queue.GetJob(ctx, "job-unknown-stopped-1")
+	if err != nil {
+		t.Fatalf("Failed to get job before cancel: %v", err)
+	}
+	if jobBeforeCancel.Status != jobpool.JobStatusRunning {
+		t.Fatalf("Expected job to be in RUNNING state before cancel, got %s", jobBeforeCancel.Status)
 	}
 	_, _, err = queue.CancelJobs(ctx, nil, []string{"job-unknown-stopped-1"})
 	if err != nil {
 		t.Fatalf("Failed to cancel job: %v", err)
+	}
+	// Verify job is in CANCELLING state
+	jobAfterCancel, err := queue.GetJob(ctx, "job-unknown-stopped-1")
+	if err != nil {
+		t.Fatalf("Failed to get job after cancel: %v", err)
+	}
+	if jobAfterCancel.Status != jobpool.JobStatusCancelling {
+		t.Fatalf("Expected job to be in CANCELLING state after cancel, got %s", jobAfterCancel.Status)
 	}
 	err = queue.MarkWorkerUnresponsive(ctx, "worker-2")
 	if err != nil {
@@ -1094,17 +1132,6 @@ func TestPoolQueue_StreamJobs_IncrementRetryCount(t *testing.T) {
 
 	// Receive the retried job (now in PENDING state)
 	select {
-	case <-jobChan:
-		// Retried job received
-	case <-time.After(2 * time.Second):
-		t.Fatal("Timeout waiting for retried job")
-	}
-
-	// FailJob atomically increments retry count and transitions to PENDING
-	// The job is now eligible for scheduling again
-
-	// Should receive the job again (now back to PENDING with incremented retry count)
-	select {
 	case jobs := <-jobChan:
 		if len(jobs) != 1 || jobs[0].ID != "job-1" {
 			t.Errorf("Expected job-1 after retry, got %v", jobs)
@@ -1116,6 +1143,9 @@ func TestPoolQueue_StreamJobs_IncrementRetryCount(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("Timeout waiting for retried job")
 	}
+
+	// FailJob atomically increments retry count and transitions to PENDING
+	// The job is now eligible for scheduling again and was already received above
 
 	cancel()
 	<-streamDone

@@ -76,10 +76,10 @@ func TestWorker_ProcessJobs(t *testing.T) {
 		t.Fatal("Job was not processed within timeout")
 	}
 
-	// Stop worker
-	worker.Stop()
+	// Give the worker time to complete the job (CompleteJob call)
+	time.Sleep(100 * time.Millisecond)
 
-	// Verify job is completed
+	// Verify job is completed before stopping worker
 	stats, err := queue.GetJobStats(ctx, []string{"tag1"})
 	if err != nil {
 		t.Fatalf("Failed to get job stats: %v", err)
@@ -87,6 +87,9 @@ func TestWorker_ProcessJobs(t *testing.T) {
 	if stats.CompletedJobs != 1 {
 		t.Errorf("Expected 1 completed job, got %d", stats.CompletedJobs)
 	}
+
+	// Stop worker
+	worker.Stop()
 }
 
 func TestWorker_RetryFailedJobs(t *testing.T) {

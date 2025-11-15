@@ -31,6 +31,7 @@ type Backend interface {
 	// - Sets result field with provided result data
 	// - Sets completed_at timestamp to current time
 	// - Sets started_at timestamp if not already set
+	// - Clears assignee_id and assigned_at (job is unassigned)
 	//
 	// State transitions:
 	// - RUNNING → COMPLETED: Normal completion flow
@@ -42,12 +43,16 @@ type Backend interface {
 	// - jobID: The unique identifier of the job to complete
 	// - result: Serialized result data (protobuf or JSON) to store with the job
 	//
-	// Returns: error if job not found, job is in invalid state, or database operation fails
+	// Returns:
+	// - freedAssigneeIDs: List of assignee IDs that had capacity freed (typically 0 or 1 element)
+	//   - Empty if job was not assigned to an assignee
+	//   - Contains assignee_id if job was assigned (assignee capacity is now available)
+	// - error if job not found, job is in invalid state, or database operation fails
 	//
 	// When to use vs other methods:
 	// - Use CompleteJob for all successful job completions
 	// - Do not use UpdateJobStatus for completion - use CompleteJob instead
-	CompleteJob(ctx context.Context, jobID string, result []byte) error
+	CompleteJob(ctx context.Context, jobID string, result []byte) ([]string, error)
 
 	// Job failure (atomic: RUNNING/UNKNOWN_RETRY → FAILED → PENDING with retry increment)
 	// FailJob atomically transitions a job to FAILED, then to PENDING, incrementing the retry count.
@@ -71,13 +76,17 @@ type Backend interface {
 	// - jobID: The unique identifier of the job that failed
 	// - errorMsg: Human-readable error message describing the failure
 	//
-	// Returns: error if job not found, job is in invalid state, or database operation fails
+	// Returns:
+	// - freedAssigneeIDs: List of assignee IDs that had capacity freed (typically 0 or 1 element)
+	//   - Empty if job was not assigned to an assignee
+	//   - Contains assignee_id if job was assigned (assignee capacity is now available)
+	// - error if job not found, job is in invalid state, or database operation fails
 	//
 	// When to use vs other methods:
 	// - Use FailJob when job should be retried (normal failure case)
 	// - Use StopJob or StopJobWithRetry when job should not be retried (cancellation case)
 	// - Do not use UpdateJobStatus for failures - use FailJob instead
-	FailJob(ctx context.Context, jobID string, errorMsg string) error
+	FailJob(ctx context.Context, jobID string, errorMsg string) ([]string, error)
 
 	// Job cancellation - stop without retry (atomic: RUNNING/CANCELLING/UNKNOWN_RETRY → STOPPED)
 	// StopJob atomically transitions a job to STOPPED with an error message.
@@ -100,13 +109,17 @@ type Backend interface {
 	// - jobID: The unique identifier of the job to stop
 	// - errorMsg: Human-readable message explaining why the job was stopped
 	//
-	// Returns: error if job not found, job is in invalid state, or database operation fails
+	// Returns:
+	// - freedAssigneeIDs: List of assignee IDs that had capacity freed (typically 0 or 1 element)
+	//   - Empty if job was not assigned to an assignee
+	//   - Contains assignee_id if job was assigned (assignee capacity is now available)
+	// - error if job not found, job is in invalid state, or database operation fails
 	//
 	// When to use vs other methods:
 	// - Use StopJob for normal cancellation acknowledgment (no retry increment needed)
 	// - Use StopJobWithRetry when cancellation happens after job failure (retry increment needed)
 	// - Use MarkJobUnknownStopped when worker is unresponsive or job is unknown to worker
-	StopJob(ctx context.Context, jobID string, errorMsg string) error
+	StopJob(ctx context.Context, jobID string, errorMsg string) ([]string, error)
 
 	// Job cancellation with retry increment (atomic: CANCELLING → STOPPED with retry increment)
 	// StopJobWithRetry atomically transitions a job from CANCELLING to STOPPED, applying all effects
@@ -130,13 +143,17 @@ type Backend interface {
 	// - jobID: The unique identifier of the job to stop
 	// - errorMsg: Human-readable error message describing the failure
 	//
-	// Returns: error if job not found, job is not in CANCELLING state, or database operation fails
+	// Returns:
+	// - freedWorkerIDs: List of worker IDs that had capacity freed (typically 0 or 1 element)
+	//   - Empty if job was not assigned to a worker
+	//   - Contains assignee_id if job was assigned (worker capacity is now available)
+	// - error if job not found, job is not in CANCELLING state, or database operation fails
 	//
 	// When to use vs other methods:
 	// - Use StopJobWithRetry when CANCELLING job fails (success=false) - applies retry increment
 	// - Use StopJob when CANCELLING job is acknowledged without failure - no retry increment
 	// - Do not use UpdateJobStatus + IncrementRetryCount separately - use StopJobWithRetry instead
-	StopJobWithRetry(ctx context.Context, jobID string, errorMsg string) error
+	StopJobWithRetry(ctx context.Context, jobID string, errorMsg string) ([]string, error)
 
 	// Mark job as unknown stopped (atomic: CANCELLING/UNKNOWN_RETRY/RUNNING → UNKNOWN_STOPPED)
 	// MarkJobUnknownStopped atomically transitions a job to UNKNOWN_STOPPED with an error message.
@@ -159,13 +176,17 @@ type Backend interface {
 	// - jobID: The unique identifier of the job to mark as unknown stopped
 	// - errorMsg: Human-readable message explaining why the job was marked as unknown stopped
 	//
-	// Returns: error if job not found or database operation fails
+	// Returns:
+	// - freedWorkerIDs: List of worker IDs that had capacity freed (typically 0 or 1 element)
+	//   - Empty if job was not assigned to a worker
+	//   - Contains assignee_id if job was assigned (worker capacity is now available)
+	// - error if job not found or database operation fails
 	//
 	// When to use vs other methods:
 	// - Use MarkJobUnknownStopped for cancellation timeouts and unknown job scenarios
 	// - Use StopJob for normal cancellation acknowledgment
 	// - Use MarkWorkerUnresponsive to mark all jobs for a worker (batch operation)
-	MarkJobUnknownStopped(ctx context.Context, jobID string, errorMsg string) error
+	MarkJobUnknownStopped(ctx context.Context, jobID string, errorMsg string) ([]string, error)
 
 	// Generic job status update (use sparingly - prefer atomic methods)
 	// UpdateJobStatus updates a job's status, result, and error message.
@@ -191,13 +212,17 @@ type Backend interface {
 	// - result: Optional serialized result data (nil if not applicable)
 	// - errorMsg: Optional error message (empty string if not applicable)
 	//
-	// Returns: error if job not found, invalid status transition, or database operation fails
+	// Returns:
+	// - freedAssigneeIDs: List of assignee IDs that had capacity freed (typically 0 or 1 element)
+	//   - Empty if job was not assigned to an assignee or not transitioning from RUNNING to terminal state
+	//   - Contains assignee_id if job was assigned and transitioning to terminal state (COMPLETED, STOPPED, UNKNOWN_STOPPED)
+	// - error if job not found, invalid status transition, or database operation fails
 	//
 	// When to use vs other methods:
 	// - Prefer atomic methods (CompleteJob, FailJob, StopJob, etc.) for common transitions
 	// - Use UpdateJobStatus only for edge cases not covered by atomic methods
 	// - Ensure related operations (e.g., retry increment) are handled separately if needed
-	UpdateJobStatus(ctx context.Context, jobID string, status JobStatus, result []byte, errorMsg string) error
+	UpdateJobStatus(ctx context.Context, jobID string, status JobStatus, result []byte, errorMsg string) ([]string, error)
 
 	// Cancellation operations
 	// CancelJobs cancels jobs by tags and/or job IDs (batch cancellation)

@@ -257,10 +257,11 @@ func (b *BadgerBackend) DequeueJobs(ctx context.Context, assigneeID string, tags
 
 // CompleteJob atomically transitions a job to COMPLETED with the given result.
 // Supports RUNNING, CANCELLING, UNKNOWN_RETRY, and UNKNOWN_STOPPED → COMPLETED transitions.
-func (b *BadgerBackend) CompleteJob(ctx context.Context, jobID string, result []byte) error {
+func (b *BadgerBackend) CompleteJob(ctx context.Context, jobID string, result []byte) ([]string, error) {
 	now := time.Now()
+	var freedAssigneeIDs []string
 
-	return b.db.Update(func(txn *badger.Txn) error {
+	err := b.db.Update(func(txn *badger.Txn) error {
 		// Get job
 		item, err := txn.Get(jobKey(jobID))
 		if err != nil {
@@ -313,16 +314,30 @@ func (b *BadgerBackend) CompleteJob(ctx context.Context, jobID string, result []
 			return fmt.Errorf("failed to marshal updated job: %w", err)
 		}
 
-		return txn.Set(jobKey(jobID), updatedJobData)
+		if err := txn.Set(jobKey(jobID), updatedJobData); err != nil {
+			return err
+		}
+
+		// Capture freed assignee ID
+		if oldAssigneeID != "" {
+			freedAssigneeIDs = []string{oldAssigneeID}
+		} else {
+			freedAssigneeIDs = []string{}
+		}
+
+		return nil
 	})
+
+	return freedAssigneeIDs, err
 }
 
 // FailJob atomically transitions a job to FAILED, then to PENDING, incrementing the retry count.
 // Supports RUNNING and UNKNOWN_RETRY → FAILED → PENDING transitions.
-func (b *BadgerBackend) FailJob(ctx context.Context, jobID string, errorMsg string) error {
+func (b *BadgerBackend) FailJob(ctx context.Context, jobID string, errorMsg string) ([]string, error) {
 	now := time.Now()
+	var freedAssigneeIDs []string
 
-	return b.db.Update(func(txn *badger.Txn) error {
+	err := b.db.Update(func(txn *badger.Txn) error {
 		// Get job
 		item, err := txn.Get(jobKey(jobID))
 		if err != nil {
@@ -375,16 +390,30 @@ func (b *BadgerBackend) FailJob(ctx context.Context, jobID string, errorMsg stri
 			return fmt.Errorf("failed to marshal updated job: %w", err)
 		}
 
-		return txn.Set(jobKey(jobID), updatedJobData)
+		if err := txn.Set(jobKey(jobID), updatedJobData); err != nil {
+			return err
+		}
+
+		// Capture freed assignee ID
+		if oldAssigneeID != "" {
+			freedAssigneeIDs = []string{oldAssigneeID}
+		} else {
+			freedAssigneeIDs = []string{}
+		}
+
+		return nil
 	})
+
+	return freedAssigneeIDs, err
 }
 
 // StopJob atomically transitions a job to STOPPED with an error message.
 // Supports RUNNING, CANCELLING, and UNKNOWN_RETRY → STOPPED transitions.
-func (b *BadgerBackend) StopJob(ctx context.Context, jobID string, errorMsg string) error {
+func (b *BadgerBackend) StopJob(ctx context.Context, jobID string, errorMsg string) ([]string, error) {
 	now := time.Now()
+	var freedAssigneeIDs []string
 
-	return b.db.Update(func(txn *badger.Txn) error {
+	err := b.db.Update(func(txn *badger.Txn) error {
 		// Get job
 		item, err := txn.Get(jobKey(jobID))
 		if err != nil {
@@ -434,16 +463,30 @@ func (b *BadgerBackend) StopJob(ctx context.Context, jobID string, errorMsg stri
 			return fmt.Errorf("failed to marshal updated job: %w", err)
 		}
 
-		return txn.Set(jobKey(jobID), updatedJobData)
+		if err := txn.Set(jobKey(jobID), updatedJobData); err != nil {
+			return err
+		}
+
+		// Capture freed assignee ID
+		if oldAssigneeID != "" {
+			freedAssigneeIDs = []string{oldAssigneeID}
+		} else {
+			freedAssigneeIDs = []string{}
+		}
+
+		return nil
 	})
+
+	return freedAssigneeIDs, err
 }
 
 // StopJobWithRetry atomically transitions a job from CANCELLING to STOPPED with retry increment.
 // Applies all effects from the transitory FAILED state (retry increment + error message).
-func (b *BadgerBackend) StopJobWithRetry(ctx context.Context, jobID string, errorMsg string) error {
+func (b *BadgerBackend) StopJobWithRetry(ctx context.Context, jobID string, errorMsg string) ([]string, error) {
 	now := time.Now()
+	var freedAssigneeIDs []string
 
-	return b.db.Update(func(txn *badger.Txn) error {
+	err := b.db.Update(func(txn *badger.Txn) error {
 		// Get job
 		item, err := txn.Get(jobKey(jobID))
 		if err != nil {
@@ -490,16 +533,30 @@ func (b *BadgerBackend) StopJobWithRetry(ctx context.Context, jobID string, erro
 			return fmt.Errorf("failed to marshal updated job: %w", err)
 		}
 
-		return txn.Set(jobKey(jobID), updatedJobData)
+		if err := txn.Set(jobKey(jobID), updatedJobData); err != nil {
+			return err
+		}
+
+		// Capture freed assignee ID
+		if oldAssigneeID != "" {
+			freedAssigneeIDs = []string{oldAssigneeID}
+		} else {
+			freedAssigneeIDs = []string{}
+		}
+
+		return nil
 	})
+
+	return freedAssigneeIDs, err
 }
 
 // MarkJobUnknownStopped atomically transitions a job to UNKNOWN_STOPPED with an error message.
 // Supports CANCELLING, UNKNOWN_RETRY, and RUNNING → UNKNOWN_STOPPED transitions.
-func (b *BadgerBackend) MarkJobUnknownStopped(ctx context.Context, jobID string, errorMsg string) error {
+func (b *BadgerBackend) MarkJobUnknownStopped(ctx context.Context, jobID string, errorMsg string) ([]string, error) {
 	now := time.Now()
+	var freedAssigneeIDs []string
 
-	return b.db.Update(func(txn *badger.Txn) error {
+	err := b.db.Update(func(txn *badger.Txn) error {
 		// Get job
 		item, err := txn.Get(jobKey(jobID))
 		if err != nil {
@@ -539,16 +596,30 @@ func (b *BadgerBackend) MarkJobUnknownStopped(ctx context.Context, jobID string,
 			return fmt.Errorf("failed to marshal updated job: %w", err)
 		}
 
-		return txn.Set(jobKey(jobID), updatedJobData)
+		if err := txn.Set(jobKey(jobID), updatedJobData); err != nil {
+			return err
+		}
+
+		// Capture freed assignee ID
+		if oldAssigneeID != "" {
+			freedAssigneeIDs = []string{oldAssigneeID}
+		} else {
+			freedAssigneeIDs = []string{}
+		}
+
+		return nil
 	})
+
+	return freedAssigneeIDs, err
 }
 
 // UpdateJobStatus updates a job's status, result, and error message.
 // This is a generic method for edge cases not covered by atomic methods.
-func (b *BadgerBackend) UpdateJobStatus(ctx context.Context, jobID string, status JobStatus, result []byte, errorMsg string) error {
+func (b *BadgerBackend) UpdateJobStatus(ctx context.Context, jobID string, status JobStatus, result []byte, errorMsg string) ([]string, error) {
 	now := time.Now()
+	var freedAssigneeIDs []string
 
-	return b.db.Update(func(txn *badger.Txn) error {
+	err := b.db.Update(func(txn *badger.Txn) error {
 		// Get job
 		item, err := txn.Get(jobKey(jobID))
 		if err != nil {
@@ -567,6 +638,15 @@ func (b *BadgerBackend) UpdateJobStatus(ctx context.Context, jobID string, statu
 
 		oldAssigneeID := job.AssigneeID
 		oldStatus := job.Status
+
+		// Get freed assignee ID if transitioning from RUNNING to terminal state
+		wasRunning := oldStatus == JobStatusRunning
+		isTerminal := status == JobStatusCompleted || status == JobStatusStopped || status == JobStatusUnknownStopped
+		if wasRunning && isTerminal && oldAssigneeID != "" {
+			freedAssigneeIDs = []string{oldAssigneeID}
+		} else {
+			freedAssigneeIDs = []string{}
+		}
 
 		// Update job status
 		job.Status = status
@@ -622,6 +702,8 @@ func (b *BadgerBackend) UpdateJobStatus(ctx context.Context, jobID string, statu
 
 		return txn.Set(jobKey(jobID), updatedJobData)
 	})
+
+	return freedAssigneeIDs, err
 }
 
 // GetJobStats gets statistics for jobs matching ALL provided tags (AND logic)

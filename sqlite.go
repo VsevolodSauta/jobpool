@@ -357,16 +357,16 @@ func (b *SQLiteBackend) getJobTags(ctx context.Context, jobID string) ([]string,
 
 // CompleteJob atomically transitions a job to COMPLETED with the given result.
 // Supports RUNNING, CANCELLING, UNKNOWN_RETRY, and UNKNOWN_STOPPED → COMPLETED transitions.
-func (b *SQLiteBackend) CompleteJob(ctx context.Context, jobID string, result []byte) error {
+func (b *SQLiteBackend) CompleteJob(ctx context.Context, jobID string, result []byte) ([]string, error) {
 	now := time.Now().Unix()
 
-	// Get current job to validate it's in a valid state
+	// Get current job to validate it's in a valid state and get assignee ID
 	job, err := b.GetJob(ctx, jobID)
 	if err != nil {
-		return fmt.Errorf("failed to get job: %w", err)
+		return nil, fmt.Errorf("failed to get job: %w", err)
 	}
 
-	// Validate job is in a state that can transition to COMPLETED
+	// Validate job is in a valid state that can transition to COMPLETED
 	validStates := map[JobStatus]bool{
 		JobStatusRunning:        true,
 		JobStatusCancelling:     true,
@@ -374,13 +374,19 @@ func (b *SQLiteBackend) CompleteJob(ctx context.Context, jobID string, result []
 		JobStatusUnknownStopped: true,
 	}
 	if !validStates[job.Status] {
-		return fmt.Errorf("job %s is not in a valid state for completion (current: %s)", jobID, job.Status)
+		return nil, fmt.Errorf("job %s is not in a valid state for completion (current: %s)", jobID, job.Status)
+	}
+
+	// Get freed assignee ID before clearing
+	freedAssigneeIDs := []string{}
+	if job.AssigneeID != "" {
+		freedAssigneeIDs = []string{job.AssigneeID}
 	}
 
 	// Update to COMPLETED in a transaction
 	tx, err := b.db.BeginTx(ctx, nil)
 	if err != nil {
-		return fmt.Errorf("failed to begin transaction: %w", err)
+		return nil, fmt.Errorf("failed to begin transaction: %w", err)
 	}
 	defer tx.Rollback()
 
@@ -400,30 +406,36 @@ func (b *SQLiteBackend) CompleteJob(ctx context.Context, jobID string, result []
 		WHERE id = ? AND status IN (?, ?, ?, ?)
 	`, JobStatusCompleted, result, now, startedAt, jobID, JobStatusRunning, JobStatusCancelling, JobStatusUnknownRetry, JobStatusUnknownStopped)
 	if err != nil {
-		return fmt.Errorf("failed to update job status: %w", err)
+		return nil, fmt.Errorf("failed to update job status: %w", err)
 	}
 
 	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("failed to commit transaction: %w", err)
+		return nil, fmt.Errorf("failed to commit transaction: %w", err)
 	}
 
-	return nil
+	return freedAssigneeIDs, nil
 }
 
 // FailJob atomically transitions a job to FAILED, then to PENDING, incrementing the retry count.
 // Supports RUNNING and UNKNOWN_RETRY → FAILED → PENDING transitions.
-func (b *SQLiteBackend) FailJob(ctx context.Context, jobID string, errorMsg string) error {
+func (b *SQLiteBackend) FailJob(ctx context.Context, jobID string, errorMsg string) ([]string, error) {
 	now := time.Now().Unix()
 
-	// Get current job to validate it's in a valid state
+	// Get current job to validate it's in a valid state and get assignee ID
 	job, err := b.GetJob(ctx, jobID)
 	if err != nil {
-		return fmt.Errorf("failed to get job: %w", err)
+		return nil, fmt.Errorf("failed to get job: %w", err)
 	}
 
 	// Validate job is in a state that can transition to FAILED
 	if job.Status != JobStatusRunning && job.Status != JobStatusUnknownRetry {
-		return fmt.Errorf("job %s is not in RUNNING or UNKNOWN_RETRY state (current: %s)", jobID, job.Status)
+		return nil, fmt.Errorf("job %s is not in RUNNING or UNKNOWN_RETRY state (current: %s)", jobID, job.Status)
+	}
+
+	// Get freed assignee ID before clearing
+	freedAssigneeIDs := []string{}
+	if job.AssigneeID != "" {
+		freedAssigneeIDs = []string{job.AssigneeID}
 	}
 
 	// Atomic transaction: FAILED → PENDING with retry increment
@@ -431,7 +443,7 @@ func (b *SQLiteBackend) FailJob(ctx context.Context, jobID string, errorMsg stri
 	// because we update status to FAILED first, then immediately to PENDING
 	tx, err := b.db.BeginTx(ctx, nil)
 	if err != nil {
-		return fmt.Errorf("failed to begin transaction: %w", err)
+		return nil, fmt.Errorf("failed to begin transaction: %w", err)
 	}
 	defer tx.Rollback()
 
@@ -443,7 +455,7 @@ func (b *SQLiteBackend) FailJob(ctx context.Context, jobID string, errorMsg stri
 		WHERE id = ? AND status IN (?, ?)
 	`, JobStatusFailed, errorMsg, jobID, JobStatusRunning, JobStatusUnknownRetry)
 	if err != nil {
-		return fmt.Errorf("failed to update job to FAILED: %w", err)
+		return nil, fmt.Errorf("failed to update job to FAILED: %w", err)
 	}
 
 	// Immediately increment retry count and set to PENDING
@@ -457,25 +469,25 @@ func (b *SQLiteBackend) FailJob(ctx context.Context, jobID string, errorMsg stri
 		WHERE id = ? AND status = ?
 	`, now, JobStatusPending, jobID, JobStatusFailed)
 	if err != nil {
-		return fmt.Errorf("failed to increment retry count: %w", err)
+		return nil, fmt.Errorf("failed to increment retry count: %w", err)
 	}
 
 	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("failed to commit transaction: %w", err)
+		return nil, fmt.Errorf("failed to commit transaction: %w", err)
 	}
 
-	return nil
+	return freedAssigneeIDs, nil
 }
 
 // StopJob atomically transitions a job to STOPPED with an error message.
 // Supports RUNNING, CANCELLING, and UNKNOWN_RETRY → STOPPED transitions.
-func (b *SQLiteBackend) StopJob(ctx context.Context, jobID string, errorMsg string) error {
+func (b *SQLiteBackend) StopJob(ctx context.Context, jobID string, errorMsg string) ([]string, error) {
 	now := time.Now().Unix()
 
-	// Get current job to validate it's in a valid state
+	// Get current job to validate it's in a valid state and get assignee ID
 	job, err := b.GetJob(ctx, jobID)
 	if err != nil {
-		return fmt.Errorf("failed to get job: %w", err)
+		return nil, fmt.Errorf("failed to get job: %w", err)
 	}
 
 	// Validate job is in a state that can transition to STOPPED
@@ -485,13 +497,19 @@ func (b *SQLiteBackend) StopJob(ctx context.Context, jobID string, errorMsg stri
 		JobStatusUnknownRetry: true,
 	}
 	if !validStates[job.Status] {
-		return fmt.Errorf("job %s is not in a valid state for stopping (current: %s)", jobID, job.Status)
+		return nil, fmt.Errorf("job %s is not in a valid state for stopping (current: %s)", jobID, job.Status)
+	}
+
+	// Get freed assignee ID before clearing
+	freedAssigneeIDs := []string{}
+	if job.AssigneeID != "" {
+		freedAssigneeIDs = []string{job.AssigneeID}
 	}
 
 	// Update to STOPPED in a transaction
 	tx, err := b.db.BeginTx(ctx, nil)
 	if err != nil {
-		return fmt.Errorf("failed to begin transaction: %w", err)
+		return nil, fmt.Errorf("failed to begin transaction: %w", err)
 	}
 	defer tx.Rollback()
 
@@ -505,35 +523,41 @@ func (b *SQLiteBackend) StopJob(ctx context.Context, jobID string, errorMsg stri
 		WHERE id = ? AND status IN (?, ?, ?)
 	`, JobStatusStopped, errorMsg, now, jobID, JobStatusRunning, JobStatusCancelling, JobStatusUnknownRetry)
 	if err != nil {
-		return fmt.Errorf("failed to update job status: %w", err)
+		return nil, fmt.Errorf("failed to update job status: %w", err)
 	}
 
 	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("failed to commit transaction: %w", err)
+		return nil, fmt.Errorf("failed to commit transaction: %w", err)
 	}
 
-	return nil
+	return freedAssigneeIDs, nil
 }
 
 // StopJobWithRetry atomically transitions a job from CANCELLING to STOPPED with retry increment.
 // Applies all effects from the transitory FAILED state (retry increment + error message).
-func (b *SQLiteBackend) StopJobWithRetry(ctx context.Context, jobID string, errorMsg string) error {
+func (b *SQLiteBackend) StopJobWithRetry(ctx context.Context, jobID string, errorMsg string) ([]string, error) {
 	now := time.Now().Unix()
 
-	// Get current job to validate it's in CANCELLING state
+	// Get current job to validate it's in CANCELLING state and get assignee ID
 	job, err := b.GetJob(ctx, jobID)
 	if err != nil {
-		return fmt.Errorf("failed to get job: %w", err)
+		return nil, fmt.Errorf("failed to get job: %w", err)
 	}
 
 	if job.Status != JobStatusCancelling {
-		return fmt.Errorf("job %s is not in CANCELLING state (current: %s)", jobID, job.Status)
+		return nil, fmt.Errorf("job %s is not in CANCELLING state (current: %s)", jobID, job.Status)
+	}
+
+	// Get freed assignee ID before clearing
+	freedAssigneeIDs := []string{}
+	if job.AssigneeID != "" {
+		freedAssigneeIDs = []string{job.AssigneeID}
 	}
 
 	// Atomic transaction: CANCELLING → STOPPED with retry increment
 	tx, err := b.db.BeginTx(ctx, nil)
 	if err != nil {
-		return fmt.Errorf("failed to begin transaction: %w", err)
+		return nil, fmt.Errorf("failed to begin transaction: %w", err)
 	}
 	defer tx.Rollback()
 
@@ -549,25 +573,37 @@ func (b *SQLiteBackend) StopJobWithRetry(ctx context.Context, jobID string, erro
 		WHERE id = ? AND status = ?
 	`, JobStatusStopped, errorMsg, now, now, jobID, JobStatusCancelling)
 	if err != nil {
-		return fmt.Errorf("failed to update job status: %w", err)
+		return nil, fmt.Errorf("failed to update job status: %w", err)
 	}
 
 	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("failed to commit transaction: %w", err)
+		return nil, fmt.Errorf("failed to commit transaction: %w", err)
 	}
 
-	return nil
+	return freedAssigneeIDs, nil
 }
 
 // MarkJobUnknownStopped atomically transitions a job to UNKNOWN_STOPPED with an error message.
 // Supports CANCELLING, UNKNOWN_RETRY, and RUNNING → UNKNOWN_STOPPED transitions.
-func (b *SQLiteBackend) MarkJobUnknownStopped(ctx context.Context, jobID string, errorMsg string) error {
+func (b *SQLiteBackend) MarkJobUnknownStopped(ctx context.Context, jobID string, errorMsg string) ([]string, error) {
 	now := time.Now().Unix()
+
+	// Get current job to get assignee ID before clearing
+	job, err := b.GetJob(ctx, jobID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get job: %w", err)
+	}
+
+	// Get freed assignee ID before clearing
+	freedAssigneeIDs := []string{}
+	if job.AssigneeID != "" {
+		freedAssigneeIDs = []string{job.AssigneeID}
+	}
 
 	// Update to UNKNOWN_STOPPED in a transaction
 	tx, err := b.db.BeginTx(ctx, nil)
 	if err != nil {
-		return fmt.Errorf("failed to begin transaction: %w", err)
+		return nil, fmt.Errorf("failed to begin transaction: %w", err)
 	}
 	defer tx.Rollback()
 
@@ -581,31 +617,39 @@ func (b *SQLiteBackend) MarkJobUnknownStopped(ctx context.Context, jobID string,
 		WHERE id = ? AND status IN (?, ?, ?)
 	`, JobStatusUnknownStopped, errorMsg, now, jobID, JobStatusCancelling, JobStatusUnknownRetry, JobStatusRunning)
 	if err != nil {
-		return fmt.Errorf("failed to update job status: %w", err)
+		return nil, fmt.Errorf("failed to update job status: %w", err)
 	}
 
 	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("failed to commit transaction: %w", err)
+		return nil, fmt.Errorf("failed to commit transaction: %w", err)
 	}
 
-	return nil
+	return freedAssigneeIDs, nil
 }
 
 // UpdateJobStatus updates a job's status, result, and error message.
 // This is a generic method for edge cases not covered by atomic methods.
-func (b *SQLiteBackend) UpdateJobStatus(ctx context.Context, jobID string, status JobStatus, result []byte, errorMsg string) error {
+func (b *SQLiteBackend) UpdateJobStatus(ctx context.Context, jobID string, status JobStatus, result []byte, errorMsg string) ([]string, error) {
 	now := time.Now().Unix()
 
-	// Get current job to check if it exists
+	// Get current job to check if it exists and get assignee ID
 	job, err := b.GetJob(ctx, jobID)
 	if err != nil {
-		return fmt.Errorf("failed to get job: %w", err)
+		return nil, fmt.Errorf("failed to get job: %w", err)
+	}
+
+	// Get freed assignee ID if transitioning from RUNNING to terminal state
+	freedAssigneeIDs := []string{}
+	wasRunning := job.Status == JobStatusRunning
+	isTerminal := status == JobStatusCompleted || status == JobStatusStopped || status == JobStatusUnknownStopped
+	if wasRunning && isTerminal && job.AssigneeID != "" {
+		freedAssigneeIDs = []string{job.AssigneeID}
 	}
 
 	// Update job status in a transaction
 	tx, err := b.db.BeginTx(ctx, nil)
 	if err != nil {
-		return fmt.Errorf("failed to begin transaction: %w", err)
+		return nil, fmt.Errorf("failed to begin transaction: %w", err)
 	}
 	defer tx.Rollback()
 
@@ -663,14 +707,14 @@ func (b *SQLiteBackend) UpdateJobStatus(ctx context.Context, jobID string, statu
 		WHERE id = ?
 	`, status, resultVal, errorMsgVal, startedAt, completedAt, assigneeIDVal, assignedAtVal, jobID)
 	if err != nil {
-		return fmt.Errorf("failed to update job status: %w", err)
+		return nil, fmt.Errorf("failed to update job status: %w", err)
 	}
 
 	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("failed to commit transaction: %w", err)
+		return nil, fmt.Errorf("failed to commit transaction: %w", err)
 	}
 
-	return nil
+	return freedAssigneeIDs, nil
 }
 
 // GetJobStats gets statistics for jobs matching ALL provided tags (AND logic)

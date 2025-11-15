@@ -7,7 +7,6 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"testing"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -15,11 +14,6 @@ import (
 
 	"github.com/VsevolodSauta/jobpool"
 )
-
-func TestCleanupExpiredJobs(t *testing.T) {
-	RegisterFailHandler(Fail)
-	RunSpecs(t, "Cleanup Expired Jobs Suite")
-}
 
 var _ = Describe("CleanupExpiredJobs", func() {
 	var (
