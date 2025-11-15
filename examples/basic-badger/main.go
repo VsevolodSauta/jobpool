@@ -38,23 +38,29 @@ func main() {
 
 	fmt.Printf("Enqueued job: %s\n", jobID)
 
-	// Dequeue the job
-	jobs, err := queue.DequeueJobs(ctx, "worker-1", nil, 1)
-	if err != nil {
-		log.Fatalf("Failed to dequeue jobs: %v", err)
-	}
-
-	if len(jobs) > 0 {
-		fmt.Printf("Dequeued job: %s (assigned to: %s)\n", jobs[0].ID, jobs[0].AssigneeID)
-
-		// Process the job
-		result := []byte(`{"status": "completed"}`)
-		err = queue.UpdateJobStatus(ctx, jobs[0].ID, jobpool.JobStatusCompleted, result, "")
-		if err != nil {
-			log.Fatalf("Failed to update job status: %v", err)
+	// Stream jobs (push-based)
+	jobCh := make(chan []*jobpool.Job, 1)
+	go func() {
+		defer close(jobCh)
+		if err := queue.StreamJobs(ctx, "worker-1", nil, 1, jobCh); err != nil {
+			log.Printf("Failed to stream jobs: %v", err)
 		}
+	}()
 
-		fmt.Printf("Job completed successfully\n")
+	// Process jobs from the channel
+	for jobs := range jobCh {
+		if len(jobs) > 0 {
+			fmt.Printf("Dequeued job: %s (assigned to: %s)\n", jobs[0].ID, jobs[0].AssigneeID)
+
+			// Process the job
+			result := []byte(`{"status": "completed"}`)
+			err = queue.CompleteJob(ctx, jobs[0].ID, result)
+			if err != nil {
+				log.Fatalf("Failed to complete job: %v", err)
+			}
+
+			fmt.Printf("Job completed successfully\n")
+		}
 	}
 
 	// Get statistics
@@ -65,4 +71,3 @@ func main() {
 
 	fmt.Printf("Statistics: Total=%d, Completed=%d\n", stats.TotalJobs, stats.CompletedJobs)
 }
-

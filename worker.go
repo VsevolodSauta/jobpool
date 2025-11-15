@@ -92,50 +92,42 @@ func (w *Worker) processLoop(ctx context.Context) {
 
 // processBatch processes a batch of jobs
 func (w *Worker) processBatch(ctx context.Context) {
-	// Dequeue jobs with assignee ID (no tag filtering for legacy worker)
-	jobs, err := w.queue.DequeueJobs(ctx, w.assigneeID, nil, w.config.BatchSize)
-	if err != nil {
-		log.Printf("[Worker] Failed to dequeue jobs: %v", err)
-		return
-	}
+	// Use StreamJobs for push-based job assignment
+	// Create a channel for receiving jobs
+	jobCh := make(chan []*Job, 1)
 
-	if len(jobs) == 0 {
-		return
-	}
+	// Start streaming jobs in a goroutine
+	go func() {
+		defer close(jobCh)
+		if err := w.queue.StreamJobs(ctx, w.assigneeID, nil, w.config.BatchSize, jobCh); err != nil {
+			log.Printf("[Worker] Failed to stream jobs: %v", err)
+		}
+	}()
 
-	// Process each job
-	for _, job := range jobs {
-		w.processJob(ctx, job)
+	// Process jobs from the channel
+	for jobs := range jobCh {
+		for _, job := range jobs {
+			w.processJob(ctx, job)
+		}
 	}
 }
 
 // processJob processes a single job
 func (w *Worker) processJob(ctx context.Context, job *Job) {
-	// Update status to running
-	if err := w.queue.UpdateJobStatus(ctx, job.ID, JobStatusRunning, nil, ""); err != nil {
-		log.Printf("[Worker] Failed to update job status to running: %v", err)
-		return
-	}
-
+	// Job is already in RUNNING state (assigned by StreamJobs/DequeueJobs)
 	// Process the job
 	result, err := w.processor(ctx, job)
 	if err != nil {
-		// Job failed - update status and reschedule
-		if updateErr := w.queue.UpdateJobStatus(ctx, job.ID, JobStatusFailed, nil, err.Error()); updateErr != nil {
-			log.Printf("[Worker] Failed to update job status to failed: %v", updateErr)
-			return
-		}
-
-		// Reschedule to end of queue (increment retry count)
-		if retryErr := w.queue.IncrementRetryCount(ctx, job.ID); retryErr != nil {
-			log.Printf("[Worker] Failed to reschedule job: %v", retryErr)
+		// Job failed - FailJob handles FAILED → PENDING transition with retry increment
+		if failErr := w.queue.FailJob(ctx, job.ID, err.Error()); failErr != nil {
+			log.Printf("[Worker] Failed to mark job as failed: %v", failErr)
 		}
 		return
 	}
 
 	// Job succeeded - update status to completed
-	if err := w.queue.UpdateJobStatus(ctx, job.ID, JobStatusCompleted, result, ""); err != nil {
-		log.Printf("[Worker] Failed to update job status to completed: %v", err)
+	if err := w.queue.CompleteJob(ctx, job.ID, result); err != nil {
+		log.Printf("[Worker] Failed to mark job as completed: %v", err)
 		return
 	}
 }

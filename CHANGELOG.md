@@ -7,6 +7,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.0] - 2025-11-15
+
+### Changed
+- **BREAKING**: Redesigned Backend and Queue interfaces for atomic operations and reduced error probability
+  - All job lifecycle transitions are now atomic (status + side effects in single operation)
+  - Removed error-prone methods: `IncrementRetryCount`, `MarkJobsAsUnknown`, `ReturnJobsToPending`
+  - Replaced with atomic methods: `CompleteJob`, `FailJob`, `StopJob`, `StopJobWithRetry`, `MarkJobUnknownStopped`
+  - `FailJob` now atomically handles: status transition (RUNNING → FAILED → PENDING), retry count increment, timestamp updates, and assignee clearing
+  - `StopJobWithRetry` atomically handles cancellation with retry increment for CANCELLING jobs that fail
+  - `MarkJobUnknownStopped` replaces `MarkJobsAsUnknown` for individual jobs
+  - `MarkWorkerUnresponsive` replaces `MarkJobsAsUnknown` for batch worker disconnect handling
+- **BREAKING**: Updated `ResetRunningJobs` behavior
+  - RUNNING jobs → UNKNOWN_RETRY (should be retried)
+  - CANCELLING jobs → UNKNOWN_STOPPED (cancellation failed, should not be retried)
+- **BREAKING**: `AcknowledgeCancellation` behavior refined
+  - Now works in conjunction with atomic methods (`StopJob`, `MarkJobUnknownStopped`)
+  - Equivalent to calling atomic methods directly, but provided for backward compatibility
+- Enhanced method documentation with comprehensive client-focused descriptions
+  - All methods now document: purpose, atomic operations, state transitions, parameters, returns, and when to use vs other methods
+  - Added "JOB LIFECYCLE OVERVIEW" section to proto file for complete lifecycle documentation
+
+### Added
+- Atomic job completion: `CompleteJob` supports transitions from RUNNING, CANCELLING, UNKNOWN_RETRY, and UNKNOWN_STOPPED states
+- Atomic job failure: `FailJob` atomically transitions RUNNING/UNKNOWN_RETRY → FAILED → PENDING with retry increment
+- Atomic job stopping: `StopJob` atomically transitions RUNNING/CANCELLING/UNKNOWN_RETRY → STOPPED
+- Atomic cancellation with retry: `StopJobWithRetry` atomically transitions CANCELLING → STOPPED with retry increment
+- Atomic unknown stopped: `MarkJobUnknownStopped` atomically transitions CANCELLING/UNKNOWN_RETRY/RUNNING → UNKNOWN_STOPPED
+- Generic status update: `UpdateJobStatus` for edge cases not covered by atomic methods (marked as "use sparingly")
+- Comprehensive BDD-style tests using Ginkgo/Gomega:
+  - `atomic_methods_test.go`: Tests for all atomic lifecycle methods
+  - `cancel_test.go`: Comprehensive cancellation flow tests
+  - `cleanup_test.go`: Tests for expired job cleanup
+- Test helper method: `SetJobCompletedAtForTesting` in SQLiteBackend for testing cleanup scenarios
+
+### Removed
+- **BREAKING**: `IncrementRetryCount` - replaced by atomic `FailJob` and `StopJobWithRetry` methods
+- **BREAKING**: `MarkJobsAsUnknown` - replaced by `MarkWorkerUnresponsive` (batch) and `MarkJobUnknownStopped` (individual)
+- **BREAKING**: `ReturnJobsToPending` - replaced by `MarkWorkerUnresponsive` which transitions RUNNING → UNKNOWN_RETRY
+
+### Fixed
+- Eliminated race conditions from non-atomic status updates
+- Fixed potential inconsistencies from separate retry count increments
+- Improved error handling for worker disconnect scenarios
+- Corrected `ResetRunningJobs` to properly handle CANCELLING jobs
+
 ## [0.1.0] - 2025-11-13
 
 ### Added
@@ -48,4 +93,5 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Makefile for common development tasks
 - golangci-lint configuration and code quality checks
 
+[1.0.0]: https://github.com/VsevolodSauta/jobpool/releases/tag/v1.0.0
 [0.1.0]: https://github.com/VsevolodSauta/jobpool/releases/tag/v0.1.0

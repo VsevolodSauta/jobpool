@@ -50,9 +50,9 @@ func TestSQLiteBackend_EnqueueDequeue(t *testing.T) {
 		t.Errorf("Expected job ID 'job-1', got '%s'", jobID)
 	}
 
-	// Dequeue the job
+	// Dequeue the job (use backend directly since DequeueJobs is internal)
 	assigneeID := "worker-1"
-	jobs, err := queue.DequeueJobs(ctx, assigneeID, nil, 10)
+	jobs, err := backend.DequeueJobs(ctx, assigneeID, nil, 10)
 	if err != nil {
 		t.Fatalf("Failed to dequeue jobs: %v", err)
 	}
@@ -106,8 +106,8 @@ func TestSQLiteBackend_AssigneeTracking(t *testing.T) {
 		}
 	}
 
-	// Assign jobs to worker-1
-	jobs1, err := queue.DequeueJobs(ctx, "worker-1", nil, 3)
+	// Assign jobs to worker-1 (use backend directly)
+	jobs1, err := backend.DequeueJobs(ctx, "worker-1", nil, 3)
 	if err != nil {
 		t.Fatalf("Failed to dequeue jobs: %v", err)
 	}
@@ -116,7 +116,7 @@ func TestSQLiteBackend_AssigneeTracking(t *testing.T) {
 	}
 
 	// Assign remaining jobs to worker-2
-	jobs2, err := queue.DequeueJobs(ctx, "worker-2", nil, 10)
+	jobs2, err := backend.DequeueJobs(ctx, "worker-2", nil, 10)
 	if err != nil {
 		t.Fatalf("Failed to dequeue jobs: %v", err)
 	}
@@ -124,19 +124,19 @@ func TestSQLiteBackend_AssigneeTracking(t *testing.T) {
 		t.Fatalf("Expected 2 jobs, got %d", len(jobs2))
 	}
 
-	// Return worker-1's jobs to pending
-	err = queue.ReturnJobsToPending(ctx, "worker-1")
+	// Mark worker-1 as unresponsive (jobs become UNKNOWN_RETRY, eligible for scheduling)
+	err = queue.MarkWorkerUnresponsive(ctx, "worker-1")
 	if err != nil {
-		t.Fatalf("Failed to return jobs to pending: %v", err)
+		t.Fatalf("Failed to mark worker unresponsive: %v", err)
 	}
 
-	// Verify worker-1's jobs are back to pending
-	jobs3, err := queue.DequeueJobs(ctx, "worker-3", nil, 10)
+	// Verify worker-1's jobs are now in UNKNOWN_RETRY state (eligible for scheduling)
+	jobs3, err := backend.DequeueJobs(ctx, "worker-3", nil, 10)
 	if err != nil {
 		t.Fatalf("Failed to dequeue jobs: %v", err)
 	}
 	if len(jobs3) != 3 {
-		t.Fatalf("Expected 3 jobs (returned from worker-1), got %d", len(jobs3))
+		t.Fatalf("Expected 3 jobs (from worker-1 marked as unknown), got %d", len(jobs3))
 	}
 }
 
@@ -214,28 +214,33 @@ func TestSQLiteBackend_RetryCount(t *testing.T) {
 		t.Fatalf("Failed to enqueue job: %v", err)
 	}
 
-	// Dequeue and mark as failed
-	jobs, err := queue.DequeueJobs(ctx, "worker-1", nil, 1)
+	// Dequeue and mark as failed (use backend directly)
+	jobs, err := backend.DequeueJobs(ctx, "worker-1", nil, 1)
 	if err != nil {
 		t.Fatalf("Failed to dequeue job: %v", err)
 	}
-	err = queue.UpdateJobStatus(ctx, jobs[0].ID, jobpool.JobStatusFailed, nil, "error")
+
+	// Use FailJob which atomically transitions RUNNING -> FAILED -> PENDING with retry increment
+	err = queue.FailJob(ctx, jobs[0].ID, "error")
 	if err != nil {
-		t.Fatalf("Failed to update job status: %v", err)
+		t.Fatalf("Failed to fail job: %v", err)
 	}
 
-	// Increment retry count
-	err = queue.IncrementRetryCount(ctx, jobs[0].ID)
-	if err != nil {
-		t.Fatalf("Failed to increment retry count: %v", err)
-	}
-
-	// Job should be back to pending
+	// Job should be back to pending (FailJob does this atomically)
 	stats, err := queue.GetJobStats(ctx, []string{"tag1"})
 	if err != nil {
 		t.Fatalf("Failed to get job stats: %v", err)
 	}
 	if stats.PendingJobs != 1 {
 		t.Errorf("Expected 1 pending job after retry, got %d", stats.PendingJobs)
+	}
+
+	// Verify retry count was incremented
+	retrievedJob, err := queue.GetJob(ctx, jobs[0].ID)
+	if err != nil {
+		t.Fatalf("Failed to get job: %v", err)
+	}
+	if retrievedJob.RetryCount != 1 {
+		t.Errorf("Expected retry count 1, got %d", retrievedJob.RetryCount)
 	}
 }

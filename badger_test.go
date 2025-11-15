@@ -50,9 +50,9 @@ func TestBadgerBackend_EnqueueDequeue(t *testing.T) {
 		t.Errorf("Expected job ID 'job-1', got '%s'", jobID)
 	}
 
-	// Dequeue the job
+	// Dequeue the job using backend directly (DequeueJobs is now internal)
 	assigneeID := "worker-1"
-	jobs, err := queue.DequeueJobs(ctx, assigneeID, nil, 10)
+	jobs, err := backend.DequeueJobs(ctx, assigneeID, nil, 10)
 	if err != nil {
 		t.Fatalf("Failed to dequeue jobs: %v", err)
 	}
@@ -109,8 +109,8 @@ func TestBadgerBackend_AssigneeTracking(t *testing.T) {
 		}
 	}
 
-	// Assign jobs to worker-1
-	jobs1, err := queue.DequeueJobs(ctx, "worker-1", nil, 3)
+	// Assign jobs to worker-1 using backend directly
+	jobs1, err := backend.DequeueJobs(ctx, "worker-1", nil, 3)
 	if err != nil {
 		t.Fatalf("Failed to dequeue jobs: %v", err)
 	}
@@ -118,8 +118,8 @@ func TestBadgerBackend_AssigneeTracking(t *testing.T) {
 		t.Fatalf("Expected 3 jobs, got %d", len(jobs1))
 	}
 
-	// Assign remaining jobs to worker-2
-	jobs2, err := queue.DequeueJobs(ctx, "worker-2", nil, 10)
+	// Assign remaining jobs to worker-2 using backend directly
+	jobs2, err := backend.DequeueJobs(ctx, "worker-2", nil, 10)
 	if err != nil {
 		t.Fatalf("Failed to dequeue jobs: %v", err)
 	}
@@ -127,19 +127,19 @@ func TestBadgerBackend_AssigneeTracking(t *testing.T) {
 		t.Fatalf("Expected 2 jobs, got %d", len(jobs2))
 	}
 
-	// Return worker-1's jobs to pending
-	err = queue.ReturnJobsToPending(ctx, "worker-1")
+	// Mark worker-1 as unresponsive (RUNNING -> UNKNOWN_RETRY)
+	err = queue.MarkWorkerUnresponsive(ctx, "worker-1")
 	if err != nil {
-		t.Fatalf("Failed to return jobs to pending: %v", err)
+		t.Fatalf("Failed to mark worker as unresponsive: %v", err)
 	}
 
-	// Verify worker-1's jobs are back to pending
-	jobs3, err := queue.DequeueJobs(ctx, "worker-3", nil, 10)
+	// Verify worker-1's jobs are now in UNKNOWN_RETRY state and can be dequeued again
+	jobs3, err := backend.DequeueJobs(ctx, "worker-3", nil, 10)
 	if err != nil {
 		t.Fatalf("Failed to dequeue jobs: %v", err)
 	}
 	if len(jobs3) != 3 {
-		t.Fatalf("Expected 3 jobs (returned from worker-1), got %d", len(jobs3))
+		t.Fatalf("Expected 3 jobs (returned from worker-1 as UNKNOWN_RETRY), got %d", len(jobs3))
 	}
 }
 

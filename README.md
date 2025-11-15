@@ -8,12 +8,15 @@ A reusable job queue library with support for multiple storage backends (SQLite,
 ## Features
 
 - Multiple backend support (SQLite, BadgerDB)
+- **Atomic job lifecycle operations** - all state transitions are atomic (status + side effects in single operation)
+- Push-based job streaming with automatic assignment
 - Job assignee tracking
-- Automatic job return-to-pending on worker disconnect
+- Worker disconnect handling with automatic retry
 - Batch job operations
 - Tag-based job filtering and statistics
-- Retry mechanism with configurable retry counts
+- Automatic retry mechanism with retry count tracking
 - Automatic cleanup of expired completed jobs
+- Comprehensive cancellation support with timeout handling
 
 ## Backends
 
@@ -32,14 +35,12 @@ A reusable job queue library with support for multiple storage backends (SQLite,
 - **No CGO required** - pure Go implementation
 - Always available, no build tags needed
 
-## Usage
-
 ## Installation
 
 ### Stable Version
 
 ```bash
-go get github.com/VsevolodSauta/jobpool@v0.1.0
+go get github.com/VsevolodSauta/jobpool@v1.0.0
 ```
 
 ### Latest Version
@@ -52,7 +53,7 @@ go get github.com/VsevolodSauta/jobpool@latest
 
 ```go
 require (
-    github.com/VsevolodSauta/jobpool v0.1.0
+    github.com/VsevolodSauta/jobpool v1.0.0
 )
 ```
 
@@ -72,7 +73,6 @@ go build -tags sqlite ./...
 - By default, the library includes SQLite support (requires CGO)
 - To build without CGO, exclude the `sqlite` build tag
 - BadgerDB backend is always available and does not require CGO
-- After the initial release, the git tag `v0.1.0` must be created and pushed for `go get` to work with version pinning
 
 #### Build Tag Details
 
@@ -130,9 +130,21 @@ func main() {
     }
     queue.EnqueueJob(context.Background(), job)
 
-    // Dequeue and process
-    jobs, _ := queue.DequeueJobs(context.Background(), "worker-1", 1)
-    // ... process jobs ...
+    // Stream jobs (push-based model)
+    jobCh := make(chan []*jobpool.Job, 1)
+    go func() {
+        defer close(jobCh)
+        queue.StreamJobs(context.Background(), "worker-1", nil, 1, jobCh)
+    }()
+
+    // Process jobs from channel
+    for jobs := range jobCh {
+        for _, job := range jobs {
+            // Process job...
+            // Complete job atomically
+            queue.CompleteJob(context.Background(), job.ID, []byte("result"))
+        }
+    }
 }
 ```
 
@@ -153,9 +165,58 @@ func main() {
     queue := jobpool.NewPoolQueue(backend)
     defer queue.Close()
 
-    // ... same as above ...
+    // Enqueue a job
+    job := &jobpool.Job{
+        ID:            "job-1",
+        Status:        jobpool.JobStatusPending,
+        JobType:       "my_task",
+        JobDefinition: []byte(`{"data": "example"}`),
+        Tags:          []string{"tag1"},
+        CreatedAt:     time.Now(),
+    }
+    queue.EnqueueJob(context.Background(), job)
+
+    // Stream jobs (push-based model)
+    jobCh := make(chan []*jobpool.Job, 1)
+    go func() {
+        defer close(jobCh)
+        queue.StreamJobs(context.Background(), "worker-1", nil, 1, jobCh)
+    }()
+
+    // Process jobs from channel
+    for jobs := range jobCh {
+        for _, job := range jobs {
+            // Process job...
+            // Complete job atomically
+            queue.CompleteJob(context.Background(), job.ID, []byte("result"))
+        }
+    }
 }
 ```
+
+## Key API Methods
+
+### Atomic Job Lifecycle Operations
+
+All job state transitions are atomic (status + side effects in a single operation):
+
+- **`CompleteJob(jobID, result)`** - Atomically transitions job to COMPLETED with result
+- **`FailJob(jobID, errorMsg)`** - Atomically transitions job to FAILED → PENDING with retry increment
+- **`StopJob(jobID, errorMsg)`** - Atomically transitions job to STOPPED (cancellation)
+- **`StopJobWithRetry(jobID, errorMsg)`** - Atomically stops job with retry increment (for CANCELLING jobs that fail)
+- **`MarkJobUnknownStopped(jobID, errorMsg)`** - Atomically marks job as UNKNOWN_STOPPED (worker unresponsive)
+
+All methods handle status transitions, timestamp updates, assignee clearing, and retry count increments atomically to prevent race conditions.
+
+### Job Management
+
+- **`EnqueueJob(job)`** / **`EnqueueJobs(jobs)`** - Submit jobs to the queue
+- **`StreamJobs(assigneeID, tags, limit, channel)`** - Push-based job streaming (jobs automatically assigned)
+- **`CancelJobs(tags, jobIDs)`** - Cancel jobs by tags or IDs
+- **`GetJob(jobID)`** - Retrieve job details
+- **`GetJobStats(tags)`** - Get statistics for jobs matching tags
+
+See the [API documentation](https://pkg.go.dev/github.com/VsevolodSauta/jobpool) for complete method reference.
 
 ## Examples
 
@@ -204,9 +265,9 @@ make lint
 
 ## Version
 
-Current version: **v0.1.0**
+Current version: **v1.0.0**
 
-See [CHANGELOG.md](CHANGELOG.md) for version history.
+**Note**: Version 1.0.0 includes breaking changes. See [CHANGELOG.md](CHANGELOG.md) for migration guide and version history.
 
 ## License
 

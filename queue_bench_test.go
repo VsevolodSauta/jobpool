@@ -120,7 +120,8 @@ func BenchmarkDequeueJobs(b *testing.B) {
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		_, err := queue.DequeueJobs(ctx, "worker-1", nil, 10)
+		// Use backend directly for benchmarking
+		_, err := backend.DequeueJobs(ctx, "worker-1", nil, 10)
 		if err != nil {
 			b.Fatalf("Failed to dequeue jobs: %v", err)
 		}
@@ -139,7 +140,7 @@ func BenchmarkDequeueJobs(b *testing.B) {
 	}
 }
 
-func BenchmarkUpdateJobStatus(b *testing.B) {
+func BenchmarkCompleteJob(b *testing.B) {
 	tmpFile, err := os.CreateTemp("", "bench_jobpool_*.db")
 	if err != nil {
 		b.Fatalf("Failed to create temp file: %v", err)
@@ -156,7 +157,7 @@ func BenchmarkUpdateJobStatus(b *testing.B) {
 	queue := jobpool.NewPoolQueue(backend)
 	ctx := context.Background()
 
-	// Pre-populate with jobs
+	// Pre-populate with jobs and assign them
 	jobIDs := make([]string, b.N)
 	for i := 0; i < b.N; i++ {
 		job := &jobpool.Job{
@@ -172,13 +173,18 @@ func BenchmarkUpdateJobStatus(b *testing.B) {
 			b.Fatalf("Failed to enqueue job: %v", err)
 		}
 		jobIDs[i] = jobID
+		// Assign job to make it RUNNING
+		_, err = backend.DequeueJobs(ctx, "worker-1", nil, 1)
+		if err != nil {
+			b.Fatalf("Failed to assign job: %v", err)
+		}
 	}
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		err := queue.UpdateJobStatus(ctx, jobIDs[i], jobpool.JobStatusCompleted, []byte("result"), "")
+		err := queue.CompleteJob(ctx, jobIDs[i], []byte("result"))
 		if err != nil {
-			b.Fatalf("Failed to update job status: %v", err)
+			b.Fatalf("Failed to complete job: %v", err)
 		}
 	}
 }
