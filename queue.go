@@ -346,6 +346,31 @@ func (q *PoolQueue) notifyWaitingWorkers(jobTags []string) {
 	}
 }
 
+// notifyWorkerByAssigneeID notifies StreamJobs workers with the given assigneeID
+// This is used when a job completes to wake up the worker's StreamJobs so it can check for more jobs
+func (q *PoolQueue) notifyWorkerByAssigneeID(assigneeID string) {
+	q.streamMu.RLock()
+	waiters := make([]*streamWaiter, 0, len(q.streamWaiters))
+	for _, waiter := range q.streamWaiters {
+		waiters = append(waiters, waiter)
+	}
+	q.streamMu.RUnlock()
+
+	// Notify all workers with matching assigneeID (regardless of tags)
+	// This ensures that when a job completes, the worker's StreamJobs wakes up
+	// to check if there are more pending jobs to assign
+	for _, waiter := range waiters {
+		if waiter.assigneeID == assigneeID {
+			// Non-blocking send
+			select {
+			case waiter.notifyCh <- struct{}{}:
+			default:
+				// Channel already has a notification, skip
+			}
+		}
+	}
+}
+
 // GetJobStats gets statistics for jobs matching ALL provided tags (AND logic)
 func (q *PoolQueue) GetJobStats(ctx context.Context, tags []string) (*JobStats, error) {
 	return q.backend.GetJobStats(ctx, tags)
@@ -359,9 +384,36 @@ func (q *PoolQueue) ResetRunningJobs(ctx context.Context) error {
 }
 
 // CompleteJob atomically transitions a job to COMPLETED with the given result.
-// No worker notification needed (COMPLETED is a terminal state).
+// Notifies the worker that completed the job so StreamJobs can check for more jobs.
+// Also notifies workers waiting for jobs with matching tags (in case there are pending jobs).
 func (q *PoolQueue) CompleteJob(ctx context.Context, jobID string, result []byte) error {
-	return q.backend.CompleteJob(ctx, jobID, result)
+	// Get job before completing to retrieve assigneeID and tags for notification
+	job, err := q.backend.GetJob(ctx, jobID)
+	if err != nil {
+		// If we can't get job, still try to complete but skip notification
+		return q.backend.CompleteJob(ctx, jobID, result)
+	}
+
+	// Complete the job
+	err = q.backend.CompleteJob(ctx, jobID, result)
+	if err != nil {
+		return err
+	}
+
+	// Notify the worker that completed this job (by assigneeID) so StreamJobs can check for more jobs
+	// This is critical: when a job completes, the worker's capacity is freed, so StreamJobs should
+	// wake up and check if there are more pending jobs to assign to this worker.
+	if job.AssigneeID != "" {
+		q.notifyWorkerByAssigneeID(job.AssigneeID)
+	}
+
+	// Also notify workers waiting for jobs with matching tags (in case there are pending jobs)
+	// This ensures that if there are other workers waiting for jobs with these tags, they get notified too
+	if len(job.Tags) > 0 {
+		q.notifyWaitingWorkers(job.Tags)
+	}
+
+	return nil
 }
 
 // FailJob atomically transitions a job to FAILED, then to PENDING, incrementing the retry count.
@@ -383,47 +435,114 @@ func (q *PoolQueue) FailJob(ctx context.Context, jobID string, errorMsg string) 
 }
 
 // StopJob atomically transitions a job to STOPPED with an error message.
-// No worker notification needed (STOPPED is a terminal state).
+// Notifies the worker that stopped the job so StreamJobs can check for more jobs.
 func (q *PoolQueue) StopJob(ctx context.Context, jobID string, errorMsg string) error {
-	return q.backend.StopJob(ctx, jobID, errorMsg)
+	// Get job before stopping to retrieve assigneeID for notification
+	job, err := q.backend.GetJob(ctx, jobID)
+	if err != nil {
+		// If we can't get job, still try to stop but skip notification
+		return q.backend.StopJob(ctx, jobID, errorMsg)
+	}
+
+	err = q.backend.StopJob(ctx, jobID, errorMsg)
+	if err != nil {
+		return err
+	}
+
+	// Notify the worker that stopped this job (by assigneeID) so StreamJobs can check for more jobs
+	// This is critical: when a job stops, the worker's capacity is freed, so StreamJobs should
+	// wake up and check if there are more pending jobs to assign to this worker.
+	if job.AssigneeID != "" {
+		q.notifyWorkerByAssigneeID(job.AssigneeID)
+	}
+
+	return nil
 }
 
 // StopJobWithRetry atomically transitions a job from CANCELLING to STOPPED with retry increment.
-// No worker notification needed (STOPPED is a terminal state, job was already in retry flow).
+// Notifies the worker that stopped the job so StreamJobs can check for more jobs.
 func (q *PoolQueue) StopJobWithRetry(ctx context.Context, jobID string, errorMsg string) error {
-	return q.backend.StopJobWithRetry(ctx, jobID, errorMsg)
+	// Get job before stopping to retrieve assigneeID for notification
+	job, err := q.backend.GetJob(ctx, jobID)
+	if err != nil {
+		// If we can't get job, still try to stop but skip notification
+		return q.backend.StopJobWithRetry(ctx, jobID, errorMsg)
+	}
+
+	err = q.backend.StopJobWithRetry(ctx, jobID, errorMsg)
+	if err != nil {
+		return err
+	}
+
+	// Notify the worker that stopped this job (by assigneeID) so StreamJobs can check for more jobs
+	// This is critical: when a job stops, the worker's capacity is freed, so StreamJobs should
+	// wake up and check if there are more pending jobs to assign to this worker.
+	if job.AssigneeID != "" {
+		q.notifyWorkerByAssigneeID(job.AssigneeID)
+	}
+
+	return nil
 }
 
 // MarkJobUnknownStopped atomically transitions a job to UNKNOWN_STOPPED with an error message.
-// No worker notification needed (UNKNOWN_STOPPED is a terminal state).
+// Notifies the worker that had this job assigned so StreamJobs can check for more jobs.
 func (q *PoolQueue) MarkJobUnknownStopped(ctx context.Context, jobID string, errorMsg string) error {
-	return q.backend.MarkJobUnknownStopped(ctx, jobID, errorMsg)
+	// Get job before marking as unknown stopped to retrieve assigneeID for notification
+	job, err := q.backend.GetJob(ctx, jobID)
+	if err != nil {
+		// If we can't get job, still try to mark but skip notification
+		return q.backend.MarkJobUnknownStopped(ctx, jobID, errorMsg)
+	}
+
+	err = q.backend.MarkJobUnknownStopped(ctx, jobID, errorMsg)
+	if err != nil {
+		return err
+	}
+
+	// Notify the worker that had this job assigned (by assigneeID) so StreamJobs can check for more jobs
+	// This is critical: when a job is marked as unknown stopped, the worker's capacity is freed,
+	// so StreamJobs should wake up and check if there are more pending jobs to assign to this worker.
+	if job.AssigneeID != "" {
+		q.notifyWorkerByAssigneeID(job.AssigneeID)
+	}
+
+	return nil
 }
 
 // UpdateJobStatus updates a job's status, result, and error message.
-// Conditionally notifies workers if job becomes eligible for scheduling.
+// Conditionally notifies workers if job becomes eligible for scheduling or transitions to terminal state.
 func (q *PoolQueue) UpdateJobStatus(ctx context.Context, jobID string, status JobStatus, result []byte, errorMsg string) error {
-	// Get job to retrieve tags for notification (if needed)
-	var job *Job
-	var shouldNotify bool
+	// Get job before updating to retrieve assigneeID and tags for notification
+	job, err := q.backend.GetJob(ctx, jobID)
+	if err != nil {
+		// If we can't get job, still try to update but skip notification
+		return q.backend.UpdateJobStatus(ctx, jobID, status, result, errorMsg)
+	}
 
-	// Check if we need to notify workers (job becomes eligible)
+	// Update the job
+	err = q.backend.UpdateJobStatus(ctx, jobID, status, result, errorMsg)
+	if err != nil {
+		return err
+	}
+
+	// Check if we need to notify workers
+	// Case 1: Job becomes eligible for scheduling (PENDING, FAILED, UNKNOWN_RETRY)
 	if status == JobStatusPending || status == JobStatusFailed || status == JobStatusUnknownRetry {
-		var err error
-		job, err = q.backend.GetJob(ctx, jobID)
-		if err != nil {
-			// If we can't get job, still try to update but skip notification
-			return q.backend.UpdateJobStatus(ctx, jobID, status, result, errorMsg)
+		// Notify workers waiting for jobs with matching tags
+		if len(job.Tags) > 0 {
+			q.notifyWaitingWorkers(job.Tags)
 		}
-		shouldNotify = true
 	}
 
-	err := q.backend.UpdateJobStatus(ctx, jobID, status, result, errorMsg)
-	if err == nil && shouldNotify && job != nil {
-		// Job is now eligible for scheduling - notify waiting workers
-		q.notifyWaitingWorkers(job.Tags)
+	// Case 2: Job transitions to terminal state (COMPLETED, STOPPED, UNKNOWN_STOPPED)
+	// Notify the worker that had this job assigned so StreamJobs can check for more jobs
+	if status == JobStatusCompleted || status == JobStatusStopped || status == JobStatusUnknownStopped {
+		if job.AssigneeID != "" {
+			q.notifyWorkerByAssigneeID(job.AssigneeID)
+		}
 	}
-	return err
+
+	return nil
 }
 
 // CleanupExpiredJobs deletes completed jobs that are older than the specified TTL.
