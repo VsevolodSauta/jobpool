@@ -29,10 +29,10 @@ var _ = Describe("Job Cancellation", func() {
 		Expect(err).NotTo(HaveOccurred())
 		tmpFile.Close()
 
-		backend, err = jobpool.NewSQLiteBackend(tmpFile.Name())
+		backend, err = jobpool.NewSQLiteBackend(tmpFile.Name(), testLogger())
 		Expect(err).NotTo(HaveOccurred())
 
-		queue = jobpool.NewPoolQueue(backend)
+		queue = jobpool.NewPoolQueue(backend, testLogger())
 	})
 
 	AfterEach(func() {
@@ -50,7 +50,7 @@ var _ = Describe("Job Cancellation", func() {
 				// Given: A pending job in the queue
 				job := &jobpool.Job{
 					ID:            "job-1",
-					Status:        jobpool.JobStatusPending,
+					Status:        jobpool.JobStatusInitialPending,
 					JobType:       "test",
 					JobDefinition: []byte("test"),
 					CreatedAt:     time.Now(),
@@ -76,15 +76,14 @@ var _ = Describe("Job Cancellation", func() {
 				// Given: A running job in the queue
 				job := &jobpool.Job{
 					ID:            "job-2",
-					Status:        jobpool.JobStatusRunning,
+					Status:        jobpool.JobStatusInitialPending,
 					JobType:       "test",
 					JobDefinition: []byte("test"),
 					CreatedAt:     time.Now(),
-					AssigneeID:    "worker-1",
 				}
 				_, err := queue.EnqueueJob(ctx, job)
 				Expect(err).NotTo(HaveOccurred())
-				// Manually set status to running using backend (normally done by DequeueJobs)
+				// Dequeue to set status to running (normally done by DequeueJobs)
 				_, err = backend.DequeueJobs(ctx, "worker-1", nil, 1)
 				Expect(err).NotTo(HaveOccurred())
 
@@ -104,11 +103,10 @@ var _ = Describe("Job Cancellation", func() {
 				// Given: A job in cancelling state
 				job := &jobpool.Job{
 					ID:            "job-cancelling",
-					Status:        jobpool.JobStatusRunning,
+					Status:        jobpool.JobStatusInitialPending,
 					JobType:       "test",
 					JobDefinition: []byte("test"),
 					CreatedAt:     time.Now(),
-					AssigneeID:    "worker-1",
 				}
 				_, err := queue.EnqueueJob(ctx, job)
 				Expect(err).NotTo(HaveOccurred())
@@ -129,10 +127,10 @@ var _ = Describe("Job Cancellation", func() {
 	Describe("Cancelling jobs in terminal states", func() {
 		Context("when a job is already completed", func() {
 			It("should return an error", func() {
-				// Given: A completed job (enqueue as PENDING, then complete it)
+				// Given: A completed job (enqueue as INITIAL_PENDING, then complete it)
 				job := &jobpool.Job{
 					ID:            "job-3",
-					Status:        jobpool.JobStatusPending,
+					Status:        jobpool.JobStatusInitialPending,
 					JobType:       "test",
 					JobDefinition: []byte("test"),
 					CreatedAt:     time.Now(),
@@ -156,10 +154,10 @@ var _ = Describe("Job Cancellation", func() {
 
 		Context("when a job is already failed", func() {
 			It("should transition to stopped", func() {
-				// Given: A job that has failed and is in FAILED state
+				// Given: A job that has failed and is in FAILED_RETRY state
 				job := &jobpool.Job{
 					ID:            "job-4",
-					Status:        jobpool.JobStatusPending,
+					Status:        jobpool.JobStatusInitialPending,
 					JobType:       "test",
 					JobDefinition: []byte("test"),
 					CreatedAt:     time.Now(),
@@ -169,17 +167,17 @@ var _ = Describe("Job Cancellation", func() {
 				// Set job to running first
 				_, err = backend.DequeueJobs(ctx, "worker-1", nil, 1)
 				Expect(err).NotTo(HaveOccurred())
-				// Use backend.UpdateJobStatus to set job to FAILED state directly
-				// (FailJob would transition FAILED → PENDING, but we want to test cancelling from FAILED state)
-				_, err = backend.UpdateJobStatus(ctx, "job-4", jobpool.JobStatusFailed, nil, "test error")
+				// Use backend.UpdateJobStatus to set job to FAILED_RETRY state directly
+				// (FailJob would transition FAILED_RETRY → INITIAL_PENDING, but we want to test cancelling from FAILED_RETRY state)
+				_, err = backend.UpdateJobStatus(ctx, "job-4", jobpool.JobStatusFailedRetry, nil, "test error")
 				Expect(err).NotTo(HaveOccurred())
 
-				// Verify job is in FAILED state
+				// Verify job is in FAILED_RETRY state
 				failedJob, err := queue.GetJob(ctx, "job-4")
 				Expect(err).NotTo(HaveOccurred())
-				Expect(failedJob.Status).To(Equal(jobpool.JobStatusFailed))
+				Expect(failedJob.Status).To(Equal(jobpool.JobStatusFailedRetry))
 
-				// When: The job is cancelled while in FAILED state
+				// When: The job is cancelled while in FAILED_RETRY state
 				_, _, err = queue.CancelJobs(ctx, nil, []string{"job-4"})
 				Expect(err).NotTo(HaveOccurred())
 
@@ -195,12 +193,17 @@ var _ = Describe("Job Cancellation", func() {
 				// Given: A job in unknown_retry state
 				job := &jobpool.Job{
 					ID:            "job-unknown-retry",
-					Status:        jobpool.JobStatusUnknownRetry,
+					Status:        jobpool.JobStatusInitialPending,
 					JobType:       "test",
 					JobDefinition: []byte("test"),
 					CreatedAt:     time.Now(),
 				}
 				_, err := queue.EnqueueJob(ctx, job)
+				Expect(err).NotTo(HaveOccurred())
+				// Dequeue and mark worker unresponsive to get to unknown_retry
+				_, err = backend.DequeueJobs(ctx, "worker-1", nil, 1)
+				Expect(err).NotTo(HaveOccurred())
+				err = queue.MarkWorkerUnresponsive(ctx, "worker-1")
 				Expect(err).NotTo(HaveOccurred())
 
 				// When: The job is cancelled
@@ -221,7 +224,7 @@ var _ = Describe("Job Cancellation", func() {
 				// Given: A job in the queue
 				job := &jobpool.Job{
 					ID:            "job-5",
-					Status:        jobpool.JobStatusPending,
+					Status:        jobpool.JobStatusInitialPending,
 					JobType:       "test",
 					JobDefinition: []byte("test"),
 					Tags:          []string{"tag1", "tag2"},
@@ -259,27 +262,24 @@ var _ = Describe("Job Cancellation", func() {
 				// Given: Multiple running and cancelling jobs assigned to a worker
 				job1 := &jobpool.Job{
 					ID:            "job-worker-1",
-					Status:        jobpool.JobStatusRunning,
+					Status:        jobpool.JobStatusInitialPending,
 					JobType:       "test",
 					JobDefinition: []byte("test1"),
 					CreatedAt:     time.Now(),
-					AssigneeID:    "worker-1",
 				}
 				job2 := &jobpool.Job{
 					ID:            "job-worker-2",
-					Status:        jobpool.JobStatusRunning,
+					Status:        jobpool.JobStatusInitialPending,
 					JobType:       "test",
 					JobDefinition: []byte("test2"),
 					CreatedAt:     time.Now(),
-					AssigneeID:    "worker-1",
 				}
 				job3 := &jobpool.Job{
 					ID:            "job-worker-3",
-					Status:        jobpool.JobStatusRunning,
+					Status:        jobpool.JobStatusInitialPending,
 					JobType:       "test",
 					JobDefinition: []byte("test3"),
 					CreatedAt:     time.Now(),
-					AssigneeID:    "worker-1",
 				}
 				_, err := queue.EnqueueJob(ctx, job1)
 				Expect(err).NotTo(HaveOccurred())
@@ -287,7 +287,7 @@ var _ = Describe("Job Cancellation", func() {
 				Expect(err).NotTo(HaveOccurred())
 				_, err = queue.EnqueueJob(ctx, job3)
 				Expect(err).NotTo(HaveOccurred())
-				// Manually set status to running using backend
+				// Dequeue to set status to running
 				_, err = backend.DequeueJobs(ctx, "worker-1", nil, 3)
 				Expect(err).NotTo(HaveOccurred())
 				// Cancel job3 to put it in cancelling state
@@ -320,11 +320,10 @@ var _ = Describe("Job Cancellation", func() {
 				// Given: A job in cancelling state
 				job := &jobpool.Job{
 					ID:            "job-cancelling-complete",
-					Status:        jobpool.JobStatusRunning,
+					Status:        jobpool.JobStatusInitialPending,
 					JobType:       "test",
 					JobDefinition: []byte("test"),
 					CreatedAt:     time.Now(),
-					AssigneeID:    "worker-1",
 				}
 				_, err := queue.EnqueueJob(ctx, job)
 				Expect(err).NotTo(HaveOccurred())
@@ -349,11 +348,10 @@ var _ = Describe("Job Cancellation", func() {
 				// Given: A job in cancelling state
 				job := &jobpool.Job{
 					ID:            "job-cancelling-stopped",
-					Status:        jobpool.JobStatusRunning,
+					Status:        jobpool.JobStatusInitialPending,
 					JobType:       "test",
 					JobDefinition: []byte("test"),
 					CreatedAt:     time.Now(),
-					AssigneeID:    "worker-1",
 				}
 				_, err := queue.EnqueueJob(ctx, job)
 				Expect(err).NotTo(HaveOccurred())
@@ -378,11 +376,10 @@ var _ = Describe("Job Cancellation", func() {
 				// Given: A job in cancelling state
 				job := &jobpool.Job{
 					ID:            "job-cancelling-unknown",
-					Status:        jobpool.JobStatusRunning,
+					Status:        jobpool.JobStatusInitialPending,
 					JobType:       "test",
 					JobDefinition: []byte("test"),
 					CreatedAt:     time.Now(),
-					AssigneeID:    "worker-1",
 				}
 				_, err := queue.EnqueueJob(ctx, job)
 				Expect(err).NotTo(HaveOccurred())
@@ -410,27 +407,24 @@ var _ = Describe("Job Cancellation", func() {
 				// Given: Multiple running and cancelling jobs in the queue
 				job1 := &jobpool.Job{
 					ID:            "job-restart-1",
-					Status:        jobpool.JobStatusRunning,
+					Status:        jobpool.JobStatusInitialPending,
 					JobType:       "test",
 					JobDefinition: []byte("test1"),
 					CreatedAt:     time.Now(),
-					AssigneeID:    "worker-1",
 				}
 				job2 := &jobpool.Job{
 					ID:            "job-restart-2",
-					Status:        jobpool.JobStatusRunning,
+					Status:        jobpool.JobStatusInitialPending,
 					JobType:       "test",
 					JobDefinition: []byte("test2"),
 					CreatedAt:     time.Now(),
-					AssigneeID:    "worker-2",
 				}
 				job3 := &jobpool.Job{
 					ID:            "job-restart-3",
-					Status:        jobpool.JobStatusRunning,
+					Status:        jobpool.JobStatusInitialPending,
 					JobType:       "test",
 					JobDefinition: []byte("test3"),
 					CreatedAt:     time.Now(),
-					AssigneeID:    "worker-3",
 				}
 				_, err := queue.EnqueueJob(ctx, job1)
 				Expect(err).NotTo(HaveOccurred())
@@ -476,7 +470,7 @@ var _ = Describe("Job Cancellation", func() {
 				// Given: Pending and completed jobs in the queue
 				pendingJob := &jobpool.Job{
 					ID:            "job-pending",
-					Status:        jobpool.JobStatusPending,
+					Status:        jobpool.JobStatusInitialPending,
 					JobType:       "test",
 					JobDefinition: []byte("test"),
 					Tags:          []string{"pending-tag"},
@@ -484,7 +478,7 @@ var _ = Describe("Job Cancellation", func() {
 				}
 				completedJob := &jobpool.Job{
 					ID:            "job-completed",
-					Status:        jobpool.JobStatusPending,
+					Status:        jobpool.JobStatusInitialPending,
 					JobType:       "test",
 					JobDefinition: []byte("test"),
 					Tags:          []string{"completed-tag"},
@@ -514,7 +508,7 @@ var _ = Describe("Job Cancellation", func() {
 				// Then: Pending and completed jobs should remain unchanged
 				pendingAfter, err := queue.GetJob(ctx, "job-pending")
 				Expect(err).NotTo(HaveOccurred())
-				Expect(pendingAfter.Status).To(Equal(jobpool.JobStatusPending))
+				Expect(pendingAfter.Status).To(Equal(jobpool.JobStatusInitialPending))
 
 				completedAfter, err := queue.GetJob(ctx, "job-completed")
 				Expect(err).NotTo(HaveOccurred())

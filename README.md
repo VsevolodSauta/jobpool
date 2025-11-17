@@ -40,7 +40,7 @@ A reusable job queue library with support for multiple storage backends (SQLite,
 ### Stable Version
 
 ```bash
-go get github.com/VsevolodSauta/jobpool@v1.0.0
+go get github.com/VsevolodSauta/jobpool@v2.0.0-rc.1
 ```
 
 ### Latest Version
@@ -53,7 +53,7 @@ go get github.com/VsevolodSauta/jobpool@latest
 
 ```go
 require (
-    github.com/VsevolodSauta/jobpool v1.0.0
+    github.com/VsevolodSauta/jobpool v2.0.0-rc.1
 )
 ```
 
@@ -122,7 +122,7 @@ func main() {
     // Enqueue a job
     job := &jobpool.Job{
         ID:            "job-1",
-        Status:        jobpool.JobStatusPending,
+        Status:        jobpool.JobStatusInitialPending,
         JobType:       "my_task",
         JobDefinition: []byte(`{"data": "example"}`),
         Tags:          []string{"tag1"},
@@ -168,7 +168,7 @@ func main() {
     // Enqueue a job
     job := &jobpool.Job{
         ID:            "job-1",
-        Status:        jobpool.JobStatusPending,
+        Status:        jobpool.JobStatusInitialPending,
         JobType:       "my_task",
         JobDefinition: []byte(`{"data": "example"}`),
         Tags:          []string{"tag1"},
@@ -201,7 +201,7 @@ func main() {
 All job state transitions are atomic (status + side effects in a single operation):
 
 - **`CompleteJob(jobID, result)`** - Atomically transitions job to COMPLETED with result
-- **`FailJob(jobID, errorMsg)`** - Atomically transitions job to FAILED → PENDING with retry increment
+- **`FailJob(jobID, errorMsg)`** - Atomically transitions job to FAILED_RETRY → INITIAL_PENDING with retry increment
 - **`StopJob(jobID, errorMsg)`** - Atomically transitions job to STOPPED (cancellation)
 - **`StopJobWithRetry(jobID, errorMsg)`** - Atomically stops job with retry increment (for CANCELLING jobs that fail)
 - **`MarkJobUnknownStopped(jobID, errorMsg)`** - Atomically marks job as UNKNOWN_STOPPED (worker unresponsive)
@@ -265,9 +265,9 @@ make lint
 
 ## Version
 
-Current version: **v1.0.0**
+Current version: **v2.0.0-rc.1**
 
-**Note**: Version 1.0.0 includes breaking changes. See [CHANGELOG.md](CHANGELOG.md) for migration guide and version history.
+**Note**: Version 2.0.0 introduces additional breaking changes (status renames, lifecycle semantics). See [CHANGELOG.md](CHANGELOG.md) for migration guidance and version history.
 
 ## License
 

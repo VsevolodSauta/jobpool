@@ -6,7 +6,7 @@ package main
 import (
 	"context"
 	"fmt"
-	"log"
+	"log/slog"
 	"os"
 	"os/signal"
 	"syscall"
@@ -16,11 +16,14 @@ import (
 )
 
 // newSQLiteBackend is a wrapper that will only compile with sqlite build tag
-func newSQLiteBackend(path string) (jobpool.Backend, error) {
-	return jobpool.NewSQLiteBackend(path)
+func newSQLiteBackend(path string, logger *slog.Logger) (jobpool.Backend, error) {
+	return jobpool.NewSQLiteBackend(path, logger)
 }
 
 func main() {
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
+		Level: slog.LevelInfo,
+	}))
 	// Create backend (SQLite requires CGO, BadgerDB does not)
 	// This example uses SQLite (requires -tags sqlite)
 	// For builds without CGO, modify to use BadgerDB instead
@@ -29,20 +32,21 @@ func main() {
 
 	// Use SQLite (requires CGO and sqlite build tag)
 	// This will fail at compile time if built without -tags sqlite
-	backend, err = newSQLiteBackend("./worker-example.db")
+	backend, err = newSQLiteBackend("./worker-example.db", logger)
 	if err != nil {
-		log.Fatalf("Failed to create backend: %v", err)
+		logger.Error("Failed to create backend", "error", err)
+		os.Exit(1)
 	}
 	defer backend.Close()
 
-	queue := jobpool.NewPoolQueue(backend)
+	queue := jobpool.NewPoolQueue(backend, logger)
 	ctx := context.Background()
 
 	// Enqueue some jobs
 	for i := 0; i < 5; i++ {
 		job := &jobpool.Job{
 			ID:            fmt.Sprintf("job-%d", i),
-			Status:        jobpool.JobStatusPending,
+			Status:        jobpool.JobStatusInitialPending,
 			JobType:       "process_task",
 			JobDefinition: []byte(fmt.Sprintf(`{"task_id": %d}`, i)),
 			Tags:          []string{"worker-demo"},
@@ -52,7 +56,8 @@ func main() {
 
 		_, err := queue.EnqueueJob(ctx, job)
 		if err != nil {
-			log.Fatalf("Failed to enqueue job: %v", err)
+			logger.Error("Failed to enqueue job", "error", err)
+			os.Exit(1)
 		}
 	}
 
@@ -70,11 +75,12 @@ func main() {
 		BatchSize:       10,
 	}
 
-	worker := jobpool.NewWorker(queue, processor, config, "example-worker")
+	worker := jobpool.NewWorker(queue, processor, config, "example-worker", logger)
 
 	// Start worker
 	if err := worker.Start(ctx); err != nil {
-		log.Fatalf("Failed to start worker: %v", err)
+		logger.Error("Failed to start worker", "error", err)
+		os.Exit(1)
 	}
 
 	fmt.Println("Worker started. Press Ctrl+C to stop...")

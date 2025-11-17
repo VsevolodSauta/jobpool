@@ -89,8 +89,8 @@ func (b *InMemoryBackend) DequeueJobs(ctx context.Context, assigneeID string, ta
 
 	// Find eligible jobs
 	for _, job := range b.jobs {
-		// Check if job is eligible (PENDING, FAILED, or UNKNOWN_RETRY)
-		if job.Status != JobStatusPending && job.Status != JobStatusFailed && job.Status != JobStatusUnknownRetry {
+		// Check if job is eligible (INITIAL_PENDING, FAILED_RETRY, or UNKNOWN_RETRY)
+		if job.Status != JobStatusInitialPending && job.Status != JobStatusFailedRetry && job.Status != JobStatusUnknownRetry {
 			continue
 		}
 
@@ -112,11 +112,21 @@ func (b *InMemoryBackend) DequeueJobs(ctx context.Context, assigneeID string, ta
 		eligibleJobs = append(eligibleJobs, job)
 	}
 
-	// Sort by priority: oldest first (by CreatedAt, then by LastRetryAt for retries)
-	// Simple sort: prioritize by CreatedAt
+	// Sort by COALESCE(last_retry_at, created_at) in ascending order (oldest first)
+	// Failure time is always >= creation time, so COALESCE is sufficient
 	for i := 0; i < len(eligibleJobs)-1; i++ {
 		for j := i + 1; j < len(eligibleJobs); j++ {
-			if eligibleJobs[i].CreatedAt.After(eligibleJobs[j].CreatedAt) {
+			// Use COALESCE(last_retry_at, created_at) for each job
+			timeI := eligibleJobs[i].CreatedAt
+			if eligibleJobs[i].LastRetryAt != nil {
+				timeI = *eligibleJobs[i].LastRetryAt
+			}
+			timeJ := eligibleJobs[j].CreatedAt
+			if eligibleJobs[j].LastRetryAt != nil {
+				timeJ = *eligibleJobs[j].LastRetryAt
+			}
+			// Sort ascending (oldest first)
+			if timeI.After(timeJ) {
 				eligibleJobs[i], eligibleJobs[j] = eligibleJobs[j], eligibleJobs[i]
 			}
 		}
@@ -157,7 +167,7 @@ func (b *InMemoryBackend) getFreedAssigneeID(jobID string) string {
 }
 
 // CompleteJob atomically transitions a job to COMPLETED
-func (b *InMemoryBackend) CompleteJob(ctx context.Context, jobID string, result []byte) ([]string, error) {
+func (b *InMemoryBackend) CompleteJob(ctx context.Context, jobID string, result []byte) (map[string]int, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
@@ -184,22 +194,23 @@ func (b *InMemoryBackend) CompleteJob(ctx context.Context, jobID string, result 
 	now := time.Now()
 	job.Status = JobStatusCompleted
 	job.Result = result
-	job.CompletedAt = &now
+	job.FinalizedAt = &now
 	if job.StartedAt == nil {
 		job.StartedAt = &now
 	}
-	job.AssigneeID = ""
-	job.AssignedAt = nil
+	// Preserve AssigneeID and AssignedAt for historical tracking
 
-	// Return freed assignee ID
+	// Return freed assignee ID (with count/multiplicity)
+	freedAssigneeIDs := make(map[string]int)
 	if freedAssigneeID != "" {
-		return []string{freedAssigneeID}, nil
+		freedAssigneeIDs[freedAssigneeID] = 1
 	}
-	return []string{}, nil
+	return freedAssigneeIDs, nil
 }
 
-// FailJob atomically transitions a job to FAILED, then to PENDING
-func (b *InMemoryBackend) FailJob(ctx context.Context, jobID string, errorMsg string) ([]string, error) {
+// FailJob atomically transitions a job to FAILED_RETRY, incrementing the retry count.
+// Job remains in FAILED_RETRY state (eligible for scheduling, but never returns to INITIAL_PENDING).
+func (b *InMemoryBackend) FailJob(ctx context.Context, jobID string, errorMsg string) (map[string]int, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
@@ -211,32 +222,30 @@ func (b *InMemoryBackend) FailJob(ctx context.Context, jobID string, errorMsg st
 	// Get freed assignee ID before clearing
 	freedAssigneeID := b.getFreedAssigneeID(jobID)
 
-	// Validate job is in a state that can transition to FAILED
+	// Validate job is in a state that can transition to FAILED_RETRY
 	if job.Status != JobStatusRunning && job.Status != JobStatusUnknownRetry {
 		return nil, fmt.Errorf("job %s is not in RUNNING or UNKNOWN_RETRY state (current: %s)", jobID, job.Status)
 	}
 
-	// Update job
+	// Update job to FAILED_RETRY with error message and increment retry count
+	// Job remains in FAILED_RETRY state (eligible for scheduling, but never returns to INITIAL_PENDING)
 	now := time.Now()
-	job.Status = JobStatusFailed
+	job.Status = JobStatusFailedRetry
 	job.ErrorMessage = errorMsg
 	job.RetryCount++
 	job.LastRetryAt = &now
+	// Preserve AssigneeID and AssignedAt for historical tracking
 
-	// Transition to PENDING
-	job.Status = JobStatusPending
-	job.AssigneeID = ""
-	job.AssignedAt = nil
-
-	// Return freed assignee ID
+	// Return freed assignee ID (with count/multiplicity)
+	freedAssigneeIDs := make(map[string]int)
 	if freedAssigneeID != "" {
-		return []string{freedAssigneeID}, nil
+		freedAssigneeIDs[freedAssigneeID] = 1
 	}
-	return []string{}, nil
+	return freedAssigneeIDs, nil
 }
 
 // StopJob atomically transitions a job to STOPPED
-func (b *InMemoryBackend) StopJob(ctx context.Context, jobID string, errorMsg string) ([]string, error) {
+func (b *InMemoryBackend) StopJob(ctx context.Context, jobID string, errorMsg string) (map[string]int, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
@@ -252,21 +261,21 @@ func (b *InMemoryBackend) StopJob(ctx context.Context, jobID string, errorMsg st
 	now := time.Now()
 	job.Status = JobStatusStopped
 	job.ErrorMessage = errorMsg
-	if job.CompletedAt == nil {
-		job.CompletedAt = &now
+	if job.FinalizedAt == nil {
+		job.FinalizedAt = &now
 	}
-	job.AssigneeID = ""
-	job.AssignedAt = nil
+	// Preserve AssigneeID and AssignedAt for historical tracking
 
-	// Return freed assignee ID
+	// Return freed assignee ID (with count/multiplicity)
+	freedAssigneeIDs := make(map[string]int)
 	if freedAssigneeID != "" {
-		return []string{freedAssigneeID}, nil
+		freedAssigneeIDs[freedAssigneeID] = 1
 	}
-	return []string{}, nil
+	return freedAssigneeIDs, nil
 }
 
 // StopJobWithRetry atomically transitions a job from CANCELLING to STOPPED with retry increment
-func (b *InMemoryBackend) StopJobWithRetry(ctx context.Context, jobID string, errorMsg string) ([]string, error) {
+func (b *InMemoryBackend) StopJobWithRetry(ctx context.Context, jobID string, errorMsg string) (map[string]int, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
@@ -288,21 +297,21 @@ func (b *InMemoryBackend) StopJobWithRetry(ctx context.Context, jobID string, er
 	job.ErrorMessage = errorMsg
 	job.RetryCount++
 	job.LastRetryAt = &now
-	if job.CompletedAt == nil {
-		job.CompletedAt = &now
+	if job.FinalizedAt == nil {
+		job.FinalizedAt = &now
 	}
-	job.AssigneeID = ""
-	job.AssignedAt = nil
+	// Preserve AssigneeID and AssignedAt for historical tracking
 
-	// Return freed assignee ID
+	// Return freed assignee ID (with count/multiplicity)
+	freedAssigneeIDs := make(map[string]int)
 	if freedAssigneeID != "" {
-		return []string{freedAssigneeID}, nil
+		freedAssigneeIDs[freedAssigneeID] = 1
 	}
-	return []string{}, nil
+	return freedAssigneeIDs, nil
 }
 
 // MarkJobUnknownStopped atomically transitions a job to UNKNOWN_STOPPED
-func (b *InMemoryBackend) MarkJobUnknownStopped(ctx context.Context, jobID string, errorMsg string) ([]string, error) {
+func (b *InMemoryBackend) MarkJobUnknownStopped(ctx context.Context, jobID string, errorMsg string) (map[string]int, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
@@ -318,21 +327,21 @@ func (b *InMemoryBackend) MarkJobUnknownStopped(ctx context.Context, jobID strin
 	now := time.Now()
 	job.Status = JobStatusUnknownStopped
 	job.ErrorMessage = errorMsg
-	if job.CompletedAt == nil {
-		job.CompletedAt = &now
+	if job.FinalizedAt == nil {
+		job.FinalizedAt = &now
 	}
-	job.AssigneeID = ""
-	job.AssignedAt = nil
+	// Preserve AssigneeID and AssignedAt for historical tracking
 
-	// Return freed assignee ID
+	// Return freed assignee ID (with count/multiplicity)
+	freedAssigneeIDs := make(map[string]int)
 	if freedAssigneeID != "" {
-		return []string{freedAssigneeID}, nil
+		freedAssigneeIDs[freedAssigneeID] = 1
 	}
-	return []string{}, nil
+	return freedAssigneeIDs, nil
 }
 
 // UpdateJobStatus updates a job's status, result, and error message
-func (b *InMemoryBackend) UpdateJobStatus(ctx context.Context, jobID string, status JobStatus, result []byte, errorMsg string) ([]string, error) {
+func (b *InMemoryBackend) UpdateJobStatus(ctx context.Context, jobID string, status JobStatus, result []byte, errorMsg string) (map[string]int, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
@@ -364,22 +373,19 @@ func (b *InMemoryBackend) UpdateJobStatus(ctx context.Context, jobID string, sta
 		job.StartedAt = &now
 	}
 	if status == JobStatusCompleted || status == JobStatusStopped || status == JobStatusUnknownStopped {
-		if job.CompletedAt == nil {
-			job.CompletedAt = &now
+		if job.FinalizedAt == nil {
+			job.FinalizedAt = &now
 		}
 	}
 
-	// Clear assignee if transitioning to non-running state
-	if status != JobStatusRunning && status != JobStatusCancelling {
-		job.AssigneeID = ""
-		job.AssignedAt = nil
-	}
+	// Preserve AssigneeID and AssignedAt for historical tracking
 
-	// Return freed assignee ID
+	// Return freed assignee ID (with count/multiplicity)
+	freedAssigneeIDs := make(map[string]int)
 	if freedAssigneeID != "" {
-		return []string{freedAssigneeID}, nil
+		freedAssigneeIDs[freedAssigneeID] = 1
 	}
-	return []string{}, nil
+	return freedAssigneeIDs, nil
 }
 
 // CancelJobs cancels jobs by tags and/or job IDs
@@ -399,13 +405,16 @@ func (b *InMemoryBackend) CancelJobs(ctx context.Context, tags []string, jobIDs 
 		}
 
 		switch job.Status {
-		case JobStatusPending:
+		case JobStatusInitialPending:
 			job.Status = JobStatusUnscheduled
 			cancelledJobIDs = append(cancelledJobIDs, jobID)
 		case JobStatusRunning:
 			job.Status = JobStatusCancelling
 			cancelledJobIDs = append(cancelledJobIDs, jobID)
-		case JobStatusFailed:
+		case JobStatusCancelling:
+			// Already cancelling - treat as no-op, include in cancelledJobIDs
+			cancelledJobIDs = append(cancelledJobIDs, jobID)
+		case JobStatusFailedRetry:
 			job.Status = JobStatusStopped
 			cancelledJobIDs = append(cancelledJobIDs, jobID)
 		case JobStatusUnknownRetry:
@@ -443,13 +452,16 @@ func (b *InMemoryBackend) CancelJobs(ctx context.Context, tags []string, jobIDs 
 		for jobID := range matchingJobIDs {
 			job := b.jobs[jobID]
 			switch job.Status {
-			case JobStatusPending:
+			case JobStatusInitialPending:
 				job.Status = JobStatusUnscheduled
 				cancelledJobIDs = append(cancelledJobIDs, jobID)
 			case JobStatusRunning:
 				job.Status = JobStatusCancelling
 				cancelledJobIDs = append(cancelledJobIDs, jobID)
-			case JobStatusFailed:
+			case JobStatusCancelling:
+				// Already cancelling - treat as no-op, include in cancelledJobIDs
+				cancelledJobIDs = append(cancelledJobIDs, jobID)
+			case JobStatusFailedRetry:
 				job.Status = JobStatusStopped
 				cancelledJobIDs = append(cancelledJobIDs, jobID)
 			case JobStatusUnknownRetry:
@@ -482,11 +494,10 @@ func (b *InMemoryBackend) AcknowledgeCancellation(ctx context.Context, jobID str
 	} else {
 		job.Status = JobStatusUnknownStopped
 	}
-	if job.CompletedAt == nil {
-		job.CompletedAt = &now
+	if job.FinalizedAt == nil {
+		job.FinalizedAt = &now
 	}
-	job.AssigneeID = ""
-	job.AssignedAt = nil
+	// Preserve AssigneeID and AssignedAt for historical tracking
 
 	return nil
 }
@@ -501,12 +512,10 @@ func (b *InMemoryBackend) MarkWorkerUnresponsive(ctx context.Context, assigneeID
 			switch job.Status {
 			case JobStatusRunning:
 				job.Status = JobStatusUnknownRetry
-				job.AssigneeID = ""
-				job.AssignedAt = nil
+				// Preserve AssigneeID and AssignedAt for historical tracking
 			case JobStatusCancelling:
 				job.Status = JobStatusUnknownStopped
-				job.AssigneeID = ""
-				job.AssignedAt = nil
+				// Preserve AssigneeID and AssignedAt for historical tracking
 			}
 		}
 	}
@@ -575,14 +584,16 @@ func (b *InMemoryBackend) GetJobStats(ctx context.Context, tags []string) (*JobS
 		job := b.jobs[jobID]
 		stats.TotalJobs++
 		switch job.Status {
-		case JobStatusPending:
+		case JobStatusInitialPending:
 			stats.PendingJobs++
 		case JobStatusRunning:
 			stats.RunningJobs++
 		case JobStatusCompleted:
 			stats.CompletedJobs++
-		case JobStatusFailed:
+		case JobStatusFailedRetry, JobStatusUnknownRetry:
 			stats.FailedJobs++
+		case JobStatusStopped, JobStatusUnscheduled, JobStatusUnknownStopped:
+			stats.StoppedJobs++
 		}
 		stats.TotalRetries += int32(job.RetryCount)
 	}
@@ -598,8 +609,7 @@ func (b *InMemoryBackend) ResetRunningJobs(ctx context.Context) error {
 	for _, job := range b.jobs {
 		if job.Status == JobStatusRunning {
 			job.Status = JobStatusUnknownRetry
-			job.AssigneeID = ""
-			job.AssignedAt = nil
+			// Preserve AssigneeID and AssignedAt for historical tracking
 		}
 	}
 
@@ -613,7 +623,7 @@ func (b *InMemoryBackend) CleanupExpiredJobs(ctx context.Context, ttl time.Durat
 
 	cutoff := time.Now().Add(-ttl)
 	for jobID, job := range b.jobs {
-		if job.Status == JobStatusCompleted && job.CompletedAt != nil && job.CompletedAt.Before(cutoff) {
+		if job.Status == JobStatusCompleted && job.FinalizedAt != nil && job.FinalizedAt.Before(cutoff) {
 			delete(b.jobs, jobID)
 			delete(b.tags, jobID)
 			for tag := range b.tags[jobID] {

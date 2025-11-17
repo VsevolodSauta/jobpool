@@ -30,10 +30,10 @@ var _ = Describe("CleanupExpiredJobs", func() {
 		Expect(err).NotTo(HaveOccurred())
 		tmpFile.Close()
 
-		backend, err = jobpool.NewSQLiteBackend(tmpFile.Name())
+		backend, err = jobpool.NewSQLiteBackend(tmpFile.Name(), testLogger())
 		Expect(err).NotTo(HaveOccurred())
 
-		queue = jobpool.NewPoolQueue(backend)
+		queue = jobpool.NewPoolQueue(backend, testLogger())
 	})
 
 	AfterEach(func() {
@@ -55,7 +55,7 @@ var _ = Describe("CleanupExpiredJobs", func() {
 				// Create old completed job
 				oldJob := &jobpool.Job{
 					ID:            "job-old-completed",
-					Status:        jobpool.JobStatusPending,
+					Status:        jobpool.JobStatusInitialPending,
 					JobType:       "test",
 					JobDefinition: []byte("test"),
 					CreatedAt:     time.Now(),
@@ -67,15 +67,15 @@ var _ = Describe("CleanupExpiredJobs", func() {
 				err = queue.CompleteJob(ctx, "job-old-completed", []byte("result"))
 				Expect(err).NotTo(HaveOccurred())
 
-				// Set completed_at to 2 hours ago using test helper
+				// Set finalized_at to 2 hours ago using test helper
 				oldTime := time.Now().Add(-2 * time.Hour)
-				err = sqliteBackend.SetJobCompletedAtForTesting(ctx, "job-old-completed", oldTime)
+				err = sqliteBackend.SetJobFinalizedAtForTesting(ctx, "job-old-completed", oldTime)
 				Expect(err).NotTo(HaveOccurred())
 
 				// Create recent completed job (completed now, so within TTL)
 				recentJob := &jobpool.Job{
 					ID:            "job-recent-completed",
-					Status:        jobpool.JobStatusPending,
+					Status:        jobpool.JobStatusInitialPending,
 					JobType:       "test",
 					JobDefinition: []byte("test"),
 					CreatedAt:     time.Now(),
@@ -111,7 +111,7 @@ var _ = Describe("CleanupExpiredJobs", func() {
 				// Create old pending job
 				pendingJob := &jobpool.Job{
 					ID:            "job-old-pending",
-					Status:        jobpool.JobStatusPending,
+					Status:        jobpool.JobStatusInitialPending,
 					JobType:       "test",
 					JobDefinition: []byte("test"),
 					CreatedAt:     oldTime,
@@ -122,7 +122,7 @@ var _ = Describe("CleanupExpiredJobs", func() {
 				// Create old running job (use tags to ensure correct dequeue)
 				runningJob := &jobpool.Job{
 					ID:            "job-old-running",
-					Status:        jobpool.JobStatusPending,
+					Status:        jobpool.JobStatusInitialPending,
 					JobType:       "test",
 					JobDefinition: []byte("test"),
 					Tags:          []string{"running"},
@@ -138,7 +138,7 @@ var _ = Describe("CleanupExpiredJobs", func() {
 				// Create old stopped job (need to be running first, use tags)
 				stoppedJob := &jobpool.Job{
 					ID:            "job-old-stopped",
-					Status:        jobpool.JobStatusPending,
+					Status:        jobpool.JobStatusInitialPending,
 					JobType:       "test",
 					JobDefinition: []byte("test"),
 					Tags:          []string{"stopped"},
@@ -162,7 +162,7 @@ var _ = Describe("CleanupExpiredJobs", func() {
 				// Then: All non-completed jobs should remain
 				pendingJobAfter, err := queue.GetJob(ctx, "job-old-pending")
 				Expect(err).NotTo(HaveOccurred())
-				Expect(pendingJobAfter.Status).To(Equal(jobpool.JobStatusPending))
+				Expect(pendingJobAfter.Status).To(Equal(jobpool.JobStatusInitialPending))
 
 				runningJobAfter, err := queue.GetJob(ctx, "job-old-running")
 				Expect(err).NotTo(HaveOccurred())
@@ -179,7 +179,7 @@ var _ = Describe("CleanupExpiredJobs", func() {
 				// Given: A recently completed job
 				job := &jobpool.Job{
 					ID:            "job-recent",
-					Status:        jobpool.JobStatusPending,
+					Status:        jobpool.JobStatusInitialPending,
 					JobType:       "test",
 					JobDefinition: []byte("test"),
 					CreatedAt:     time.Now(),
@@ -224,7 +224,7 @@ var _ = Describe("CleanupExpiredJobs", func() {
 					jobID := fmt.Sprintf("job-expired-%d", i)
 					job := &jobpool.Job{
 						ID:            jobID,
-						Status:        jobpool.JobStatusPending,
+						Status:        jobpool.JobStatusInitialPending,
 						JobType:       "test",
 						JobDefinition: []byte("test"),
 						CreatedAt:     time.Now(),
@@ -236,9 +236,9 @@ var _ = Describe("CleanupExpiredJobs", func() {
 					err = queue.CompleteJob(ctx, jobID, []byte("result"))
 					Expect(err).NotTo(HaveOccurred())
 
-					// Set completed_at to 2 hours ago
+					// Set finalized_at to 2 hours ago
 					oldTime := time.Now().Add(-2 * time.Hour)
-					err = sqliteBackend.SetJobCompletedAtForTesting(ctx, jobID, oldTime)
+					err = sqliteBackend.SetJobFinalizedAtForTesting(ctx, jobID, oldTime)
 					Expect(err).NotTo(HaveOccurred())
 				}
 
@@ -263,7 +263,7 @@ var _ = Describe("CleanupExpiredJobs", func() {
 					jobID := fmt.Sprintf("job-recent-%d", i)
 					job := &jobpool.Job{
 						ID:            jobID,
-						Status:        jobpool.JobStatusPending,
+						Status:        jobpool.JobStatusInitialPending,
 						JobType:       "test",
 						JobDefinition: []byte("test"),
 						CreatedAt:     time.Now(),

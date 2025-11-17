@@ -5,6 +5,32 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.0.0-rc.1] - 2025-11-17
+
+### Breaking
+- Renamed lifecycle statuses to clarify semantics:
+  - `JobStatusPending` → `JobStatusInitialPending`
+  - `JobStatusFailed` → `JobStatusFailedRetry`
+- Jobs that fail no longer return to `INITIAL_PENDING`; they remain in `FAILED_RETRY` while still eligible for scheduling.
+- Renamed `Job.CompletedAt` to `Job.FinalizedAt` and updated all lifecycle methods to populate the field consistently.
+- Backend lifecycle methods (`CompleteJob`, `FailJob`, `StopJob`, `StopJobWithRetry`) now return `map[string]int` describing freed capacity per assignee instead of string slices.
+- Assignee metadata (`assignee_id`, `assigned_at`) is preserved for historical tracking even after completion/failure, requiring downstream consumers to stop assuming those fields are cleared.
+- `JobStats` structure was updated to report `StoppedJobs` separately and to treat `FAILED_RETRY`/`UNKNOWN_RETRY` as part of failed counts.
+
+### Added
+- Subscription-based `StreamJobs` implementation with explicit per-worker capacity tracking and tag-aware routing.
+- Worker subscription registry with automatic rebalancing when jobs complete/fail, improving fairness across tag filters.
+- `queue.md` architecture guide describing the push-based assignment model and worker expectations.
+- Comprehensive Ginkgo BDD suite (`queue_bdd_test.go`, `stream_bdd_test.go`) that exercises lifecycle flows across backends.
+
+### Changed
+- Queue internals were rewritten to focus on push-based streaming rather than repeated dequeue polling, reducing duplicate work under high contention.
+- Capacity notifications now reflect the actual number of freed slots per worker instead of assuming a single job per completion.
+- Examples were updated to use the new status names and clarify how to enqueue `INITIAL_PENDING` jobs.
+
+### Removed
+- Deprecated `queue_test.go`, `queue_bench_test.go`, and backend-specific tests replaced by the new BDD harness.
+
 ## [1.2.0] - 2025-01-XX
 
 ### Added
@@ -21,9 +47,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Test for UNKNOWN_STOPPED → COMPLETED transition
 
 ### Fixed
-- Fixed test for FAILED → STOPPED transition to actually test the correct state transition
-  - Previously tested PENDING → UNSCHEDULED instead of FAILED → STOPPED
-  - Now correctly uses backend.UpdateJobStatus to set job to FAILED state before cancellation
+- Fixed test for FAILED_RETRY → STOPPED transition to actually test the correct state transition
+  - Previously tested INITIAL_PENDING → UNSCHEDULED instead of FAILED_RETRY → STOPPED
+  - Now correctly uses backend.UpdateJobStatus to set job to FAILED_RETRY state before cancellation
 - Removed duplicate/misleading test case that incorrectly suggested CANCELLING → COMPLETED was an invalid transition
 
 ## [1.1.0] - 2025-11-15
@@ -45,7 +71,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - All job lifecycle transitions are now atomic (status + side effects in single operation)
   - Removed error-prone methods: `IncrementRetryCount`, `MarkJobsAsUnknown`, `ReturnJobsToPending`
   - Replaced with atomic methods: `CompleteJob`, `FailJob`, `StopJob`, `StopJobWithRetry`, `MarkJobUnknownStopped`
-  - `FailJob` now atomically handles: status transition (RUNNING → FAILED → PENDING), retry count increment, timestamp updates, and assignee clearing
+  - `FailJob` now atomically handles: status transition (RUNNING → FAILED_RETRY → INITIAL_PENDING), retry count increment, timestamp updates, and assignee clearing
   - `StopJobWithRetry` atomically handles cancellation with retry increment for CANCELLING jobs that fail
   - `MarkJobUnknownStopped` replaces `MarkJobsAsUnknown` for individual jobs
   - `MarkWorkerUnresponsive` replaces `MarkJobsAsUnknown` for batch worker disconnect handling
@@ -61,7 +87,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 - Atomic job completion: `CompleteJob` supports transitions from RUNNING, CANCELLING, UNKNOWN_RETRY, and UNKNOWN_STOPPED states
-- Atomic job failure: `FailJob` atomically transitions RUNNING/UNKNOWN_RETRY → FAILED → PENDING with retry increment
+- Atomic job failure: `FailJob` atomically transitions RUNNING/UNKNOWN_RETRY → FAILED_RETRY → INITIAL_PENDING with retry increment
 - Atomic job stopping: `StopJob` atomically transitions RUNNING/CANCELLING/UNKNOWN_RETRY → STOPPED
 - Atomic cancellation with retry: `StopJobWithRetry` atomically transitions CANCELLING → STOPPED with retry increment
 - Atomic unknown stopped: `MarkJobUnknownStopped` atomically transitions CANCELLING/UNKNOWN_RETRY/RUNNING → UNKNOWN_STOPPED
@@ -70,7 +96,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `atomic_methods_test.go`: Tests for all atomic lifecycle methods
   - `cancel_test.go`: Comprehensive cancellation flow tests
   - `cleanup_test.go`: Tests for expired job cleanup
-- Test helper method: `SetJobCompletedAtForTesting` in SQLiteBackend for testing cleanup scenarios
+- Test helper method: `SetJobFinalizedAtForTesting` in SQLiteBackend for testing cleanup scenarios
 
 ### Removed
 - **BREAKING**: `IncrementRetryCount` - replaced by atomic `FailJob` and `StopJobWithRetry` methods
@@ -124,5 +150,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Makefile for common development tasks
 - golangci-lint configuration and code quality checks
 
+[2.0.0-rc.1]: https://github.com/VsevolodSauta/jobpool/releases/tag/v2.0.0-rc.1
 [1.0.0]: https://github.com/VsevolodSauta/jobpool/releases/tag/v1.0.0
 [0.1.0]: https://github.com/VsevolodSauta/jobpool/releases/tag/v0.1.0

@@ -2,325 +2,445 @@ package jobpool
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
+	"fmt"
+	"log/slog"
+	"sort"
 	"sync"
 	"time"
 )
 
-// Queue represents the job queue interface.
-// All queue operations are thread-safe and can be called concurrently.
+// Queue provides a thread-safe job queue with push-based job assignment,
+// capacity management, and tag-based filtering.
 type Queue interface {
 	// Job submission
 	EnqueueJob(ctx context.Context, job *Job) (string, error)
 	EnqueueJobs(ctx context.Context, jobs []*Job) ([]string, error)
 
 	// Job streaming (push-based)
-	// StreamJobs streams eligible jobs (PENDING, FAILED, UNKNOWN_RETRY) matching the tag filter to the provided channel.
-	// This method blocks until jobs become available or the context is cancelled.
-	// Jobs are automatically assigned to the specified assigneeID (marked as RUNNING) via DequeueJobs.
-	// tags: Filter jobs by tags using AND logic (jobs must have ALL provided tags). Empty slice means no filtering.
-	// limit: Maximum number of jobs per batch sent to the channel.
-	// The channel is closed when the context is cancelled, the queue is closed, or an error occurs.
-	// This method should be called in a goroutine as it blocks.
-	StreamJobs(ctx context.Context, assigneeID string, tags []string, limit int, ch chan<- []*Job) error
+	StreamJobs(ctx context.Context, assigneeID string, tags []string, maxAssignedJobs int, ch chan<- []*Job) error
 
-	// Job lifecycle (delegates to Backend)
-	// CompleteJob atomically transitions a job to COMPLETED with the given result.
-	//
-	// When to use Queue vs Backend:
-	// - Use Queue.CompleteJob when you want the standard behavior (delegates to Backend)
-	// - Queue does not notify workers for COMPLETED jobs (terminal state, no scheduling needed)
-	// - Use Backend.CompleteJob directly only if you need to bypass Queue's notification system
-	//
-	// Delegation behavior:
-	// - Delegates to Backend.CompleteJob
-	// - No worker notification (COMPLETED is a terminal state)
-	//
-	// State transitions: RUNNING/CANCELLING/UNKNOWN_RETRY/UNKNOWN_STOPPED → COMPLETED
+	// Job lifecycle
 	CompleteJob(ctx context.Context, jobID string, result []byte) error
-
-	// FailJob atomically transitions a job to FAILED, then to PENDING, incrementing the retry count.
-	//
-	// When to use Queue vs Backend:
-	// - Use Queue.FailJob when you want worker notification after job becomes eligible (PENDING state)
-	// - Queue notifies waiting workers after the job transitions to PENDING
-	// - Use Backend.FailJob directly only if you need to bypass Queue's notification system
-	//
-	// Delegation behavior:
-	// - Delegates to Backend.FailJob
-	// - Notifies waiting workers after job transitions to PENDING (job becomes eligible for scheduling)
-	//
-	// Worker notification:
-	// - Workers are notified when job becomes PENDING (eligible for scheduling)
-	// - Notification uses job tags to match workers with appropriate tag filters
-	//
-	// State transitions: RUNNING/UNKNOWN_RETRY → FAILED → PENDING
 	FailJob(ctx context.Context, jobID string, errorMsg string) error
-
-	// StopJob atomically transitions a job to STOPPED with an error message.
-	//
-	// When to use Queue vs Backend:
-	// - Use Queue.StopJob when you want the standard behavior (delegates to Backend)
-	// - Queue does not notify workers for STOPPED jobs (terminal state, no scheduling needed)
-	// - Use Backend.StopJob directly only if you need to bypass Queue's notification system
-	//
-	// Delegation behavior:
-	// - Delegates to Backend.StopJob
-	// - No worker notification (STOPPED is a terminal state)
-	//
-	// State transitions: RUNNING/CANCELLING/UNKNOWN_RETRY → STOPPED
 	StopJob(ctx context.Context, jobID string, errorMsg string) error
-
-	// StopJobWithRetry atomically transitions a job from CANCELLING to STOPPED with retry increment.
-	//
-	// When to use Queue vs Backend:
-	// - Use Queue.StopJobWithRetry when you want the standard behavior (delegates to Backend)
-	// - Queue does not notify workers for STOPPED jobs (terminal state, no scheduling needed)
-	// - Use Backend.StopJobWithRetry directly only if you need to bypass Queue's notification system
-	//
-	// Delegation behavior:
-	// - Delegates to Backend.StopJobWithRetry
-	// - No worker notification (STOPPED is a terminal state, job was already in retry flow)
-	//
-	// State transitions: CANCELLING → STOPPED (with retry increment)
 	StopJobWithRetry(ctx context.Context, jobID string, errorMsg string) error
-
-	// MarkJobUnknownStopped atomically transitions a job to UNKNOWN_STOPPED with an error message.
-	//
-	// When to use Queue vs Backend:
-	// - Use Queue.MarkJobUnknownStopped when you want the standard behavior (delegates to Backend)
-	// - Queue does not notify workers for UNKNOWN_STOPPED jobs (terminal state, no scheduling needed)
-	// - Use Backend.MarkJobUnknownStopped directly only if you need to bypass Queue's notification system
-	//
-	// Delegation behavior:
-	// - Delegates to Backend.MarkJobUnknownStopped
-	// - No worker notification (UNKNOWN_STOPPED is a terminal state)
-	//
-	// State transitions: CANCELLING/UNKNOWN_RETRY/RUNNING → UNKNOWN_STOPPED
 	MarkJobUnknownStopped(ctx context.Context, jobID string, errorMsg string) error
-
-	// UpdateJobStatus updates a job's status, result, and error message (use sparingly).
-	//
-	// When to use Queue vs Backend:
-	// - Use Queue.UpdateJobStatus when you want conditional worker notification
-	// - Queue notifies waiting workers if job becomes eligible (PENDING, FAILED, UNKNOWN_RETRY)
-	// - Use Backend.UpdateJobStatus directly only if you need to bypass Queue's notification system
-	//
-	// Delegation behavior:
-	// - Delegates to Backend.UpdateJobStatus
-	// - Conditionally notifies workers if job becomes eligible for scheduling
-	//
-	// Worker notification:
-	// - Workers are notified only if job transitions to PENDING, FAILED, or UNKNOWN_RETRY
-	// - Notification uses job tags to match workers with appropriate tag filters
-	// - No notification for terminal states (COMPLETED, STOPPED, UNSCHEDULED, UNKNOWN_STOPPED)
-	//
-	// Client usage patterns:
-	// - Prefer atomic methods (CompleteJob, FailJob, StopJob, etc.) for common transitions
-	// - Use UpdateJobStatus only for edge cases not covered by atomic methods
-	// - Ensure related operations (e.g., retry increment) are handled separately if needed
 	UpdateJobStatus(ctx context.Context, jobID string, status JobStatus, result []byte, errorMsg string) error
 
-	// Cancellation (delegates to Backend)
+	// Cancellation
 	CancelJobs(ctx context.Context, tags []string, jobIDs []string) ([]string, []string, error)
 	AcknowledgeCancellation(ctx context.Context, jobID string, wasExecuting bool) error
 
-	// Worker management (delegates to Backend)
+	// Worker management
 	MarkWorkerUnresponsive(ctx context.Context, assigneeID string) error
 
-	// Query operations (delegates to Backend)
+	// Query operations
 	GetJob(ctx context.Context, jobID string) (*Job, error)
 	GetJobStats(ctx context.Context, tags []string) (*JobStats, error)
 
-	// Maintenance (delegates to Backend)
+	// Maintenance
 	CleanupExpiredJobs(ctx context.Context, ttl time.Duration) error
 	ResetRunningJobs(ctx context.Context) error
-
-	// DeleteJobs forcefully deletes jobs by tags and/or job IDs
-	// This method validates that all jobs are in final states (COMPLETED, UNSCHEDULED, STOPPED, UNKNOWN_STOPPED)
-	// before deletion. If any job is not in a final state, an error is returned.
-	// tags: Filter jobs by tags using AND logic (jobs must have ALL provided tags)
-	// jobIDs: Specific job IDs to delete
-	// Both tags and jobIDs are processed (union of both sets)
-	// Returns error if any job is not in a final state or if deletion fails
 	DeleteJobs(ctx context.Context, tags []string, jobIDs []string) error
 
 	Close() error
 }
 
-// streamWaiter represents a waiting StreamJobs call
-type streamWaiter struct {
-	assigneeID string
-	tags       []string
-	notifyCh   chan struct{}
+// subscription represents an active StreamJobs call
+type subscription struct {
+	id              uint64 // unique subscription ID
+	assigneeID      string
+	tags            []string
+	maxCapacity     int
+	currentCapacity int
+	ch              chan<- []*Job
+	assignedJobs    map[string]bool // job IDs assigned to this subscription
+	notifyCh        chan struct{}   // notification channel for this subscription
+	mu              sync.Mutex
 }
 
-// PoolQueue implements the Queue interface using a Backend.
+// PoolQueue implements the Queue interface using a Backend for storage.
 type PoolQueue struct {
 	backend       Backend
-	streamWaiters map[string]*streamWaiter // key: worker identifier (assigneeID + tags hash)
-	streamMu      sync.RWMutex             // protects streamWaiters
+	logger        *slog.Logger
+	mu            sync.RWMutex
+	subscriptions map[uint64]*subscription // active StreamJobs calls
+	nextSubID     uint64
+	closed        bool
+	closeCh       chan struct{} // closed when queue is closed
 }
 
-// NewPoolQueue creates a new queue with the given backend.
-// The backend must not be nil.
-func NewPoolQueue(backend Backend) *PoolQueue {
+// NewPoolQueue creates a new PoolQueue with the given backend.
+func NewPoolQueue(backend Backend, logger *slog.Logger) Queue {
 	return &PoolQueue{
 		backend:       backend,
-		streamWaiters: make(map[string]*streamWaiter),
+		logger:        logger,
+		subscriptions: make(map[uint64]*subscription),
+		closeCh:       make(chan struct{}),
 	}
 }
 
-// EnqueueJob enqueues a single job into the queue.
-// Returns the job ID on success, or an error if the operation fails.
+// EnqueueJob enqueues a single job and notifies waiting workers.
 func (q *PoolQueue) EnqueueJob(ctx context.Context, job *Job) (string, error) {
-	jobID, err := q.backend.EnqueueJob(ctx, job)
-	if err == nil {
-		// Notify waiting workers that a new eligible job is available
-		q.notifyWaitingWorkers(job.Tags)
+	if job == nil {
+		q.logger.Debug("EnqueueJob: error - job is nil")
+		return "", fmt.Errorf("job is nil")
 	}
-	return jobID, err
+	q.logger.Debug("EnqueueJob", "jobID", job.ID, "jobType", job.JobType, "status", job.Status, "tags", job.Tags)
+	if job.ID == "" {
+		q.logger.Debug("EnqueueJob: error - job ID is empty")
+		return "", fmt.Errorf("job ID is empty")
+	}
+	if job.Status != JobStatusInitialPending {
+		q.logger.Debug("EnqueueJob: error - invalid status", "status", job.Status, "expected", "INITIAL_PENDING")
+		return "", fmt.Errorf("job status must be INITIAL_PENDING, got %s", job.Status)
+	}
+
+	jobID, err := q.backend.EnqueueJob(ctx, job)
+	if err != nil {
+		q.logger.Debug("EnqueueJob: backend.EnqueueJob error", "jobID", job.ID, "error", err)
+		return "", err
+	}
+	q.logger.Debug("EnqueueJob: backend.EnqueueJob returned", "jobID", jobID)
+
+	// Notify workers with matching tags
+	q.logger.Debug("EnqueueJob: notifying workers", "tags", job.Tags)
+	q.notifyWorkers(job.Tags)
+
+	return jobID, nil
 }
 
-// EnqueueJobs enqueues multiple jobs in a batch operation.
-// This is more efficient than calling EnqueueJob multiple times.
-// Returns a slice of job IDs in the same order as the input jobs, or an error if the operation fails.
+// EnqueueJobs enqueues multiple jobs and notifies workers (deduplicated by tag combination).
 func (q *PoolQueue) EnqueueJobs(ctx context.Context, jobs []*Job) ([]string, error) {
-	jobIDs, err := q.backend.EnqueueJobs(ctx, jobs)
-	if err == nil {
-		// Notify waiting workers for each job's tags
-		// Use a set to avoid duplicate notifications for same tag combinations
-		notifiedTags := make(map[string]bool)
-		for _, job := range jobs {
-			tagKey := q.tagsKey(job.Tags)
-			if !notifiedTags[tagKey] {
-				q.notifyWaitingWorkers(job.Tags)
-				notifiedTags[tagKey] = true
-			}
+	q.logger.Debug("EnqueueJobs", "count", len(jobs))
+	if len(jobs) == 0 {
+		q.logger.Debug("EnqueueJobs: empty job list, returning")
+		return []string{}, nil
+	}
+
+	// Validate all jobs first (before accessing fields)
+	for _, job := range jobs {
+		if job == nil {
+			q.logger.Debug("EnqueueJobs: error - job is nil")
+			return nil, fmt.Errorf("job is nil")
 		}
 	}
-	return jobIDs, err
-}
 
-// dequeueJobs is an internal method that dequeues pending jobs up to the specified limit and assigns them to the given assigneeID.
-// Jobs are selected in order of priority (oldest first, considering retry timestamps).
-// The jobs are automatically marked as "running" and assigned to the specified assigneeID.
-// tags: Filter jobs by tags using AND logic (jobs must have ALL provided tags). Empty slice means no filtering.
-// Returns a slice of jobs (may be empty if no pending jobs are available), or an error if the operation fails.
-func (q *PoolQueue) dequeueJobs(ctx context.Context, assigneeID string, tags []string, limit int) ([]*Job, error) {
-	return q.backend.DequeueJobs(ctx, assigneeID, tags, limit)
-}
-
-// StreamJobs streams eligible jobs (PENDING, FAILED, UNKNOWN_RETRY) matching the tag filter to the provided channel.
-// This method blocks until jobs become available or the context is cancelled.
-// Jobs are automatically assigned to the specified assigneeID (marked as RUNNING) via DequeueJobs.
-// tags: Filter jobs by tags using AND logic (jobs must have ALL provided tags). Empty slice means no filtering.
-// limit: Maximum number of jobs per batch sent to the channel.
-// The channel is closed when the context is cancelled, the queue is closed, or an error occurs.
-// This method should be called in a goroutine as it blocks.
-func (q *PoolQueue) StreamJobs(ctx context.Context, assigneeID string, tags []string, limit int, ch chan<- []*Job) error {
-	// Generate worker identifier
-	workerID := q.workerIdentifier(assigneeID, tags)
-
-	// Create notification channel
-	notifyCh := make(chan struct{}, 1)
-
-	// Register waiter
-	q.streamMu.Lock()
-	q.streamWaiters[workerID] = &streamWaiter{
-		assigneeID: assigneeID,
-		tags:       tags,
-		notifyCh:   notifyCh,
+	// Collect job IDs and tags for logging (after validation)
+	jobIDs := make([]string, len(jobs))
+	allTags := make(map[string]bool)
+	for i, job := range jobs {
+		jobIDs[i] = job.ID
+		for _, tag := range job.Tags {
+			allTags[tag] = true
+		}
 	}
-	q.streamMu.Unlock()
+	q.logger.Debug("EnqueueJobs", "jobIDs", jobIDs, "uniqueTags", allTags)
 
-	// Cleanup on exit
+	// Validate job fields
+	for _, job := range jobs {
+		if job.ID == "" {
+			q.logger.Debug("EnqueueJobs: error - job ID is empty")
+			return nil, fmt.Errorf("job ID is empty")
+		}
+		if job.Status != JobStatusInitialPending {
+			q.logger.Debug("EnqueueJobs: error - invalid status", "status", job.Status, "jobID", job.ID, "expected", "INITIAL_PENDING")
+			return nil, fmt.Errorf("job %s status must be INITIAL_PENDING, got %s", job.ID, job.Status)
+		}
+	}
+
+	jobIDs, err := q.backend.EnqueueJobs(ctx, jobs)
+	if err != nil {
+		q.logger.Debug("EnqueueJobs: backend.EnqueueJobs error", "error", err)
+		return jobIDs, err
+	}
+	q.logger.Debug("EnqueueJobs: backend.EnqueueJobs returned", "jobIDs", jobIDs)
+
+	// Deduplicate tag combinations and notify
+	tagCombos := make(map[string]bool)
+	notifiedTagCombos := 0
+	for _, job := range jobs {
+		comboKey := tagComboKey(job.Tags)
+		if !tagCombos[comboKey] {
+			tagCombos[comboKey] = true
+			notifiedTagCombos++
+			q.logger.Debug("EnqueueJobs: notifying workers for tag combo", "tags", job.Tags)
+			q.notifyWorkers(job.Tags)
+		}
+	}
+	q.logger.Debug("EnqueueJobs: notified unique tag combinations", "count", notifiedTagCombos)
+
+	return jobIDs, nil
+}
+
+// tagComboKey creates a unique key for a tag combination (sorted for consistency).
+func tagComboKey(tags []string) string {
+	if len(tags) == 0 {
+		return ""
+	}
+	sorted := make([]string, len(tags))
+	copy(sorted, tags)
+	sort.Strings(sorted)
+	key := ""
+	for _, tag := range sorted {
+		key += tag + ","
+	}
+	return key
+}
+
+// StreamJobs provides push-based job assignment with capacity management.
+func (q *PoolQueue) StreamJobs(ctx context.Context, assigneeID string, tags []string, maxAssignedJobs int, ch chan<- []*Job) error {
+	q.logger.Debug("StreamJobs: starting", "assigneeID", assigneeID, "tags", tags, "maxAssignedJobs", maxAssignedJobs)
+	if assigneeID == "" {
+		q.logger.Debug("StreamJobs: error - assigneeID is empty")
+		return fmt.Errorf("assigneeID is empty")
+	}
+	if maxAssignedJobs <= 0 {
+		q.logger.Debug("StreamJobs: error - maxAssignedJobs must be > 0", "maxAssignedJobs", maxAssignedJobs)
+		return fmt.Errorf("maxAssignedJobs must be > 0, got %d", maxAssignedJobs)
+	}
+	if ch == nil {
+		q.logger.Debug("StreamJobs: error - channel is nil")
+		return fmt.Errorf("channel is nil")
+	}
+
+	// Register subscription
+	sub := q.registerSubscription(assigneeID, tags, maxAssignedJobs, ch)
 	defer func() {
-		q.streamMu.Lock()
-		delete(q.streamWaiters, workerID)
-		close(notifyCh)
-		q.streamMu.Unlock()
-		close(ch)
+		q.logger.Debug("StreamJobs: unregistering subscription", "assigneeID", assigneeID, "subID", sub.id)
+		q.unregisterSubscription(sub.id)
 	}()
 
-	// Try initial dequeue in case jobs are already available
-	jobs, err := q.dequeueJobs(ctx, assigneeID, tags, limit)
-	if err != nil {
-		return err
-	}
-	if len(jobs) > 0 {
-		select {
-		case ch <- jobs:
-		case <-ctx.Done():
-			return ctx.Err()
-		}
-	}
+	// Initial dequeue if capacity available
+	q.logger.Debug("StreamJobs: performing initial dequeue", "assigneeID", assigneeID, "subID", sub.id)
+	q.tryDequeueForSubscription(ctx, sub)
 
-	// Main loop: wait for notifications and dequeue jobs
+	// Main loop: wait for notifications or context cancellation
+	q.logger.Debug("StreamJobs: entering main loop", "assigneeID", assigneeID, "subID", sub.id)
 	for {
 		select {
 		case <-ctx.Done():
+			// Context cancelled - cleanup assigned but undelivered jobs
+			q.logger.Debug("StreamJobs: context cancelled", "assigneeID", assigneeID, "subID", sub.id, "error", ctx.Err())
+			q.cleanupSubscriptionJobs(ctx, sub)
+			close(ch)
 			return ctx.Err()
-		case _, ok := <-notifyCh:
-			// Channel closed - queue is being closed, exit
-			if !ok {
-				return nil
-			}
-			// Jobs may be available, try to dequeue
-			jobs, err := q.dequeueJobs(ctx, assigneeID, tags, limit)
-			if err != nil {
-				return err
-			}
-			if len(jobs) > 0 {
-				select {
-				case ch <- jobs:
-				case <-ctx.Done():
-					return ctx.Err()
-				}
-			}
+		case <-sub.notifyCh:
+			// Notification received - try to dequeue jobs
+			q.logger.Debug("StreamJobs: notification received", "assigneeID", sub.assigneeID, "subID", sub.id)
+			q.tryDequeueForSubscription(ctx, sub)
+		case <-q.closeCh:
+			// Queue closed
+			q.logger.Debug("StreamJobs: queue closed", "assigneeID", assigneeID, "subID", sub.id)
+			q.cleanupSubscriptionJobs(ctx, sub)
+			close(ch)
+			return nil
 		}
 	}
 }
 
-// workerIdentifier generates a unique identifier for a worker based on assigneeID and tags
-func (q *PoolQueue) workerIdentifier(assigneeID string, tags []string) string {
-	// Create a hash of tags for uniqueness
-	h := sha256.New()
-	h.Write([]byte(assigneeID))
-	for _, tag := range tags {
-		h.Write([]byte(tag))
+// registerSubscription registers a new StreamJobs subscription.
+func (q *PoolQueue) registerSubscription(assigneeID string, tags []string, maxCapacity int, ch chan<- []*Job) *subscription {
+	q.logger.Debug("registerSubscription", "assigneeID", assigneeID, "tags", tags, "maxCapacity", maxCapacity)
+	q.mu.Lock()
+	defer q.mu.Unlock()
+
+	sub := &subscription{
+		id:              q.nextSubID,
+		assigneeID:      assigneeID,
+		tags:            tags,
+		maxCapacity:     maxCapacity,
+		currentCapacity: maxCapacity,
+		ch:              ch,
+		assignedJobs:    make(map[string]bool),
+		notifyCh:        make(chan struct{}, 1), // buffered for non-blocking
 	}
-	hash := hex.EncodeToString(h.Sum(nil))
-	return assigneeID + ":" + hash[:16] // Use first 16 chars of hash
+	q.nextSubID++
+	q.subscriptions[sub.id] = sub
+	q.logger.Debug("registerSubscription: registered", "subID", sub.id, "assigneeID", assigneeID, "totalSubscriptions", len(q.subscriptions))
+
+	return sub
 }
 
-// tagsKey generates a key for a set of tags (for deduplication)
-func (q *PoolQueue) tagsKey(tags []string) string {
-	h := sha256.New()
-	for _, tag := range tags {
-		h.Write([]byte(tag))
+// unregisterSubscription removes a subscription.
+func (q *PoolQueue) unregisterSubscription(subID uint64) {
+	q.logger.Debug("unregisterSubscription", "subID", subID)
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	sub, exists := q.subscriptions[subID]
+	if exists {
+		q.logger.Debug("unregisterSubscription: removing", "subID", subID, "assigneeID", sub.assigneeID, "remainingSubscriptions", len(q.subscriptions)-1)
+	} else {
+		q.logger.Debug("unregisterSubscription: subID not found", "subID", subID)
 	}
-	return hex.EncodeToString(h.Sum(nil))
+	delete(q.subscriptions, subID)
 }
 
-// tagsMatch checks if job tags match worker tags using AND logic
-// Worker tags must ALL be present in job tags
-func tagsMatch(jobTags []string, workerTags []string) bool {
-	// Empty worker tags means "accept all jobs"
-	if len(workerTags) == 0 {
-		return true
+// tryDequeueForSubscription attempts to dequeue jobs for a subscription.
+func (q *PoolQueue) tryDequeueForSubscription(ctx context.Context, sub *subscription) {
+	q.logger.Debug("tryDequeueForSubscription", "assigneeID", sub.assigneeID, "subID", sub.id)
+	for {
+		sub.mu.Lock()
+		availableCapacity := sub.currentCapacity
+		sub.mu.Unlock()
+
+		q.logger.Debug("tryDequeueForSubscription", "assigneeID", sub.assigneeID, "availableCapacity", availableCapacity)
+		if availableCapacity <= 0 {
+			q.logger.Debug("tryDequeueForSubscription: no capacity, returning", "assigneeID", sub.assigneeID)
+			return
+		}
+
+		// Dequeue jobs from backend
+		jobs, err := q.backend.DequeueJobs(ctx, sub.assigneeID, sub.tags, availableCapacity)
+		if err != nil {
+			q.logger.Debug("tryDequeueForSubscription: DequeueJobs error", "error", err, "assigneeID", sub.assigneeID)
+			// Log error but don't fail - will retry on next notification
+			return
+		}
+
+		q.logger.Debug("tryDequeueForSubscription: DequeueJobs returned", "jobCount", len(jobs), "assigneeID", sub.assigneeID)
+		if len(jobs) == 0 {
+			q.logger.Debug("tryDequeueForSubscription: no jobs found, returning", "assigneeID", sub.assigneeID)
+			return
+		}
+
+		// Update subscription capacity and track assigned jobs
+		sub.mu.Lock()
+		sub.currentCapacity -= len(jobs)
+		for _, job := range jobs {
+			sub.assignedJobs[job.ID] = true
+			q.logger.Debug("tryDequeueForSubscription: assigned job", "jobID", job.ID, "assigneeID", sub.assigneeID)
+		}
+		sub.mu.Unlock()
+
+		// Send jobs to channel
+		// If channel is full, jobs are still assigned (per spec) but we'll retry sending
+		q.logger.Debug("tryDequeueForSubscription: sending jobs to channel", "jobCount", len(jobs), "assigneeID", sub.assigneeID)
+		select {
+		case sub.ch <- jobs:
+			q.logger.Debug("tryDequeueForSubscription: successfully sent jobs to channel", "jobCount", len(jobs), "assigneeID", sub.assigneeID)
+			// Successfully sent - continue to check if more capacity is available
+			continue
+		default:
+			q.logger.Debug("tryDequeueForSubscription: channel full, jobs still assigned", "assigneeID", sub.assigneeID)
+			// Channel full - jobs are still assigned and will be sent later
+			// Schedule a retry by sending a notification
+			select {
+			case sub.notifyCh <- struct{}{}:
+			default:
+				// Notification channel also full, will retry on next external notification
+			}
+			return
+		}
+	}
+}
+
+// cleanupSubscriptionJobs transitions RUNNING jobs assigned to this subscription to FAILED_RETRY.
+func (q *PoolQueue) cleanupSubscriptionJobs(ctx context.Context, sub *subscription) {
+	q.logger.Debug("cleanupSubscriptionJobs", "assigneeID", sub.assigneeID, "subID", sub.id)
+	sub.mu.Lock()
+	jobIDs := make([]string, 0, len(sub.assignedJobs))
+	for jobID := range sub.assignedJobs {
+		jobIDs = append(jobIDs, jobID)
+	}
+	sub.mu.Unlock()
+	q.logger.Debug("cleanupSubscriptionJobs: found assigned jobs", "count", len(jobIDs), "assigneeID", sub.assigneeID, "subID", sub.id, "jobIDs", jobIDs)
+
+	// Determine termination reason for error message
+	errorMsg := "StreamJobs terminated"
+	if ctx.Err() != nil {
+		errorMsg = "StreamJobs terminated: " + ctx.Err().Error()
+	}
+	q.logger.Debug("cleanupSubscriptionJobs", "errorMsg", errorMsg, "assigneeID", sub.assigneeID, "subID", sub.id)
+
+	// Check each job and transition if still RUNNING
+	transitionedCount := 0
+	for _, jobID := range jobIDs {
+		job, err := q.backend.GetJob(ctx, jobID)
+		if err != nil {
+			q.logger.Debug("cleanupSubscriptionJobs: GetJob error", "jobID", jobID, "error", err)
+			continue
+		}
+		if job.Status == JobStatusRunning {
+			// Transition to FAILED_RETRY with termination error message
+			q.logger.Debug("cleanupSubscriptionJobs: transitioning job from RUNNING to FAILED_RETRY", "jobID", jobID)
+			_, err := q.backend.FailJob(ctx, jobID, errorMsg)
+			if err != nil {
+				q.logger.Debug("cleanupSubscriptionJobs: FailJob error", "jobID", jobID, "error", err)
+			} else {
+				transitionedCount++
+			}
+		} else {
+			q.logger.Debug("cleanupSubscriptionJobs: job not transitioning", "jobID", jobID, "status", job.Status)
+		}
+	}
+	q.logger.Debug("cleanupSubscriptionJobs: transitioned jobs", "count", transitionedCount, "assigneeID", sub.assigneeID, "subID", sub.id)
+}
+
+// notifyWorkers notifies all matching subscriptions about new eligible jobs.
+func (q *PoolQueue) notifyWorkers(jobTags []string) {
+	q.logger.Debug("notifyWorkers", "jobTags", jobTags)
+	q.mu.RLock()
+	subs := make([]*subscription, 0, len(q.subscriptions))
+	for _, sub := range q.subscriptions {
+		subs = append(subs, sub)
+	}
+	totalSubs := len(q.subscriptions)
+	q.mu.RUnlock()
+	q.logger.Debug("notifyWorkers: found total subscriptions", "count", totalSubs)
+
+	// Notify all matching subscriptions (at-most-once per subscription)
+	notifiedCount := 0
+	skippedNoMatch := 0
+	skippedNoCapacity := 0
+	skippedFullChannel := 0
+	for _, sub := range subs {
+		// Check if subscription matches job tags
+		// If jobTags is nil, notify all subscriptions (used when we don't know which tags are available)
+		matches := jobTags == nil || matchesTags(jobTags, sub.tags)
+		if !matches {
+			skippedNoMatch++
+			continue
+		}
+
+		sub.mu.Lock()
+		hasCapacity := sub.currentCapacity > 0
+		currentCap := sub.currentCapacity
+		sub.mu.Unlock()
+
+		if !hasCapacity {
+			skippedNoCapacity++
+			q.logger.Debug("notifyWorkers: skipping subscription (no capacity)", "subID", sub.id, "assigneeID", sub.assigneeID, "capacity", currentCap)
+			continue
+		}
+
+		// Send notification to this subscription (non-blocking, at-most-once)
+		select {
+		case sub.notifyCh <- struct{}{}:
+			notifiedCount++
+			q.logger.Debug("notifyWorkers: notified subscription", "subID", sub.id, "assigneeID", sub.assigneeID, "tags", sub.tags, "capacity", currentCap)
+		default:
+			skippedFullChannel++
+			q.logger.Debug("notifyWorkers: channel full (notification already pending)", "subID", sub.id, "assigneeID", sub.assigneeID)
+			// Channel full - notification already pending
+		}
+	}
+	q.logger.Debug("notifyWorkers: completed", "notified", notifiedCount, "skippedNoMatch", skippedNoMatch, "skippedNoCapacity", skippedNoCapacity, "skippedFullChannel", skippedFullChannel)
+}
+
+// matchesTags checks if job tags contain all subscription tags (AND logic).
+func matchesTags(jobTags []string, subTags []string) bool {
+	if len(subTags) == 0 {
+		return true // Empty tags means accept all jobs
 	}
 
-	// Create a map of job tags for quick lookup
-	jobTagMap := make(map[string]bool, len(jobTags))
+	jobTagSet := make(map[string]bool)
 	for _, tag := range jobTags {
-		jobTagMap[tag] = true
+		jobTagSet[tag] = true
 	}
 
-	// All worker tags must be in job tags
-	for _, workerTag := range workerTags {
-		if !jobTagMap[workerTag] {
+	for _, subTag := range subTags {
+		if !jobTagSet[subTag] {
 			return false
 		}
 	}
@@ -328,310 +448,429 @@ func tagsMatch(jobTags []string, workerTags []string) bool {
 	return true
 }
 
-// notifyWaitingWorkers notifies waiting StreamJobs workers when eligible jobs appear
-func (q *PoolQueue) notifyWaitingWorkers(jobTags []string) {
-	q.streamMu.RLock()
-	waiters := make([]*streamWaiter, 0, len(q.streamWaiters))
-	for _, waiter := range q.streamWaiters {
-		waiters = append(waiters, waiter)
-	}
-	q.streamMu.RUnlock()
-
-	// Notify matching workers
-	for _, waiter := range waiters {
-		if tagsMatch(jobTags, waiter.tags) {
-			// Non-blocking send
-			select {
-			case waiter.notifyCh <- struct{}{}:
-			default:
-				// Channel already has a notification, skip
-			}
-		}
-	}
-}
-
-// notifyAssigneeByID notifies StreamJobs waiters with the given assigneeID
-// This is used when a job completes to wake up the assignee's StreamJobs so it can check for more jobs
-func (q *PoolQueue) notifyAssigneeByID(assigneeID string) {
-	q.streamMu.RLock()
-	waiters := make([]*streamWaiter, 0, len(q.streamWaiters))
-	for _, waiter := range q.streamWaiters {
-		waiters = append(waiters, waiter)
-	}
-	q.streamMu.RUnlock()
-
-	// Notify all waiters with matching assigneeID (regardless of tags)
-	// This ensures that when a job completes, the assignee's StreamJobs wakes up
-	// to check if there are more pending jobs to assign
-	for _, waiter := range waiters {
-		if waiter.assigneeID == assigneeID {
-			// Non-blocking send
-			select {
-			case waiter.notifyCh <- struct{}{}:
-			default:
-				// Channel already has a notification, skip
-			}
-		}
-	}
-}
-
-// GetJobStats gets statistics for jobs matching ALL provided tags (AND logic)
-func (q *PoolQueue) GetJobStats(ctx context.Context, tags []string) (*JobStats, error) {
-	return q.backend.GetJobStats(ctx, tags)
-}
-
-// ResetRunningJobs marks all running jobs as unknown state.
-// This is called when the service restarts and there are jobs that were in progress.
-// Jobs marked as unknown indicate they were assigned to workers that are no longer available.
-func (q *PoolQueue) ResetRunningJobs(ctx context.Context) error {
-	return q.backend.ResetRunningJobs(ctx)
-}
-
-// CompleteJob atomically transitions a job to COMPLETED with the given result.
-// Notifies assignees that had capacity freed and workers waiting for jobs with matching tags.
+// CompleteJob completes a job and frees capacity.
 func (q *PoolQueue) CompleteJob(ctx context.Context, jobID string, result []byte) error {
-	// Get job before completing to retrieve tags for notification
+	q.logger.Debug("CompleteJob", "jobID", jobID)
+	// Get job before completion to get tags for notification
 	job, err := q.backend.GetJob(ctx, jobID)
 	if err != nil {
-		// If we can't get job, still try to complete but skip notification
-		freedAssigneeIDs, err := q.backend.CompleteJob(ctx, jobID, result)
-		if err != nil {
-			return err
-		}
-		// Notify freed assignees
-		for _, assigneeID := range freedAssigneeIDs {
-			q.notifyAssigneeByID(assigneeID)
-		}
-		return nil
+		return err
 	}
+	jobTags := job.Tags
+	q.logger.Debug("CompleteJob", "jobID", jobID, "assigneeID", job.AssigneeID, "tags", jobTags)
 
-	// Complete the job - backend returns freed assignee IDs
+	// Complete job in backend
 	freedAssigneeIDs, err := q.backend.CompleteJob(ctx, jobID, result)
 	if err != nil {
 		return err
 	}
+	q.logger.Debug("CompleteJob: backend returned freedAssigneeIDs", "freedAssigneeIDs", freedAssigneeIDs, "jobID", jobID)
 
-	// Notify assignees that had capacity freed so StreamJobs can check for more jobs
-	// This is critical: when a job completes, the assignee's capacity is freed, so StreamJobs should
-	// wake up and check if there are more pending jobs to assign to this assignee.
-	for _, assigneeID := range freedAssigneeIDs {
-		q.notifyAssigneeByID(assigneeID)
-	}
-
-	// Also notify workers waiting for jobs with matching tags (in case there are pending jobs)
-	// This ensures that if there are other workers waiting for jobs with these tags, they get notified too
-	if len(job.Tags) > 0 {
-		q.notifyWaitingWorkers(job.Tags)
-	}
+	// Free capacity for affected subscriptions and notify
+	q.freeCapacityAndNotify(freedAssigneeIDs, jobTags)
 
 	return nil
 }
 
-// FailJob atomically transitions a job to FAILED, then to PENDING, incrementing the retry count.
-// Notifies assignees that had capacity freed and workers waiting for jobs with matching tags.
+// FailJob fails a job and frees capacity.
 func (q *PoolQueue) FailJob(ctx context.Context, jobID string, errorMsg string) error {
-	// Get job to retrieve tags for notification
-	job, err := q.backend.GetJob(ctx, jobID)
-	if err != nil {
-		freedAssigneeIDs, err := q.backend.FailJob(ctx, jobID, errorMsg)
-		if err != nil {
-			return err
-		}
-		// Notify freed assignees
-		for _, assigneeID := range freedAssigneeIDs {
-			q.notifyAssigneeByID(assigneeID)
-		}
-		return nil
+	q.logger.Debug("FailJob", "jobID", jobID, "errorMsg", errorMsg)
+	if errorMsg == "" {
+		return fmt.Errorf("errorMsg is required")
 	}
 
+	// Get job before failure to get tags for notification
+	job, err := q.backend.GetJob(ctx, jobID)
+	if err != nil {
+		q.logger.Debug("FailJob: GetJob error", "jobID", jobID, "error", err)
+		return err
+	}
+	q.logger.Debug("FailJob", "jobID", jobID, "currentStatus", job.Status, "assigneeID", job.AssigneeID, "tags", job.Tags)
+	jobTags := job.Tags
+
+	// Fail job in backend
 	freedAssigneeIDs, err := q.backend.FailJob(ctx, jobID, errorMsg)
 	if err != nil {
+		q.logger.Debug("FailJob: backend.FailJob error", "jobID", jobID, "error", err)
 		return err
 	}
+	q.logger.Debug("FailJob: backend.FailJob returned freedAssigneeIDs", "freedAssigneeIDs", freedAssigneeIDs, "jobID", jobID)
 
-	// Notify assignees that had capacity freed
-	for _, assigneeID := range freedAssigneeIDs {
-		q.notifyAssigneeByID(assigneeID)
+	// Verify job state after backend operation
+	jobAfter, err := q.backend.GetJob(ctx, jobID)
+	if err != nil {
+		q.logger.Debug("FailJob: GetJob after FailJob error", "jobID", jobID, "error", err)
+	} else {
+		q.logger.Debug("FailJob: status after FailJob", "jobID", jobID, "status", jobAfter.Status)
 	}
 
-	// Job is now in PENDING state (after FAILED -> IncrementRetryCount -> PENDING)
-	// Notify waiting workers
-	if len(job.Tags) > 0 {
-		q.notifyWaitingWorkers(job.Tags)
-	}
+	// Free capacity for affected subscriptions and notify
+	q.freeCapacityAndNotify(freedAssigneeIDs, jobTags)
 
 	return nil
 }
 
-// StopJob atomically transitions a job to STOPPED with an error message.
-// Notifies assignees that had capacity freed so StreamJobs can check for more jobs.
+// StopJob stops a job and frees capacity.
 func (q *PoolQueue) StopJob(ctx context.Context, jobID string, errorMsg string) error {
-	// Stop the job - backend returns freed assignee IDs
-	freedAssigneeIDs, err := q.backend.StopJob(ctx, jobID, errorMsg)
-	if err != nil {
-		return err
-	}
-
-	// Notify assignees that had capacity freed so StreamJobs can check for more jobs
-	// This is critical: when a job stops, the assignee's capacity is freed, so StreamJobs should
-	// wake up and check if there are more pending jobs to assign to this assignee.
-	for _, assigneeID := range freedAssigneeIDs {
-		q.notifyAssigneeByID(assigneeID)
-	}
-
-	return nil
-}
-
-// StopJobWithRetry atomically transitions a job from CANCELLING to STOPPED with retry increment.
-// Notifies assignees that had capacity freed so StreamJobs can check for more jobs.
-func (q *PoolQueue) StopJobWithRetry(ctx context.Context, jobID string, errorMsg string) error {
-	// Stop the job - backend returns freed assignee IDs
-	freedAssigneeIDs, err := q.backend.StopJobWithRetry(ctx, jobID, errorMsg)
-	if err != nil {
-		return err
-	}
-
-	// Notify assignees that had capacity freed so StreamJobs can check for more jobs
-	// This is critical: when a job stops, the assignee's capacity is freed, so StreamJobs should
-	// wake up and check if there are more pending jobs to assign to this assignee.
-	for _, assigneeID := range freedAssigneeIDs {
-		q.notifyAssigneeByID(assigneeID)
-	}
-
-	return nil
-}
-
-// MarkJobUnknownStopped atomically transitions a job to UNKNOWN_STOPPED with an error message.
-// Notifies assignees that had capacity freed so StreamJobs can check for more jobs.
-func (q *PoolQueue) MarkJobUnknownStopped(ctx context.Context, jobID string, errorMsg string) error {
-	// Mark job as unknown stopped - backend returns freed assignee IDs
-	freedAssigneeIDs, err := q.backend.MarkJobUnknownStopped(ctx, jobID, errorMsg)
-	if err != nil {
-		return err
-	}
-
-	// Notify assignees that had capacity freed so StreamJobs can check for more jobs
-	// This is critical: when a job is marked as unknown stopped, the assignee's capacity is freed,
-	// so StreamJobs should wake up and check if there are more pending jobs to assign to this assignee.
-	for _, assigneeID := range freedAssigneeIDs {
-		q.notifyAssigneeByID(assigneeID)
-	}
-
-	return nil
-}
-
-// UpdateJobStatus updates a job's status, result, and error message.
-// Conditionally notifies assignees and workers if job becomes eligible for scheduling or transitions to terminal state.
-func (q *PoolQueue) UpdateJobStatus(ctx context.Context, jobID string, status JobStatus, result []byte, errorMsg string) error {
-	// Get job before updating to retrieve tags for notification
+	q.logger.Debug("StopJob", "jobID", jobID, "errorMsg", errorMsg)
+	// Get job before stopping
 	job, err := q.backend.GetJob(ctx, jobID)
 	if err != nil {
-		// If we can't get job, still try to update but skip notification
-		freedAssigneeIDs, err := q.backend.UpdateJobStatus(ctx, jobID, status, result, errorMsg)
-		if err != nil {
-			return err
-		}
-		// Notify freed assignees
-		for _, assigneeID := range freedAssigneeIDs {
-			q.notifyAssigneeByID(assigneeID)
-		}
-		return nil
-	}
-
-	// Update the job - backend returns freed assignee IDs
-	freedAssigneeIDs, err := q.backend.UpdateJobStatus(ctx, jobID, status, result, errorMsg)
-	if err != nil {
+		q.logger.Debug("StopJob: GetJob error", "jobID", jobID, "error", err)
 		return err
 	}
+	q.logger.Debug("StopJob", "jobID", jobID, "currentStatus", job.Status, "assigneeID", job.AssigneeID, "tags", job.Tags)
 
-	// Notify assignees that had capacity freed
-	for _, assigneeID := range freedAssigneeIDs {
-		q.notifyAssigneeByID(assigneeID)
+	// Stop job in backend
+	freedAssigneeIDs, err := q.backend.StopJob(ctx, jobID, errorMsg)
+	if err != nil {
+		q.logger.Debug("StopJob: backend.StopJob error", "jobID", jobID, "error", err)
+		return err
+	}
+	q.logger.Debug("StopJob: backend.StopJob returned freedAssigneeIDs", "freedAssigneeIDs", freedAssigneeIDs, "jobID", jobID)
+
+	// Verify job state after backend operation
+	jobAfter, err := q.backend.GetJob(ctx, jobID)
+	if err != nil {
+		q.logger.Debug("StopJob: GetJob after StopJob error", "jobID", jobID, "error", err)
+	} else {
+		q.logger.Debug("StopJob: status after StopJob", "jobID", jobID, "status", jobAfter.Status, "assigneeID", jobAfter.AssigneeID)
 	}
 
-	// Check if we need to notify workers waiting for jobs
-	// Case 1: Job becomes eligible for scheduling (PENDING, FAILED, UNKNOWN_RETRY)
-	if status == JobStatusPending || status == JobStatusFailed || status == JobStatusUnknownRetry {
-		// Notify workers waiting for jobs with matching tags
-		if len(job.Tags) > 0 {
-			q.notifyWaitingWorkers(job.Tags)
+	// Free capacity for affected subscriptions
+	q.freeCapacityAndNotify(freedAssigneeIDs, job.Tags)
+
+	return nil
+}
+
+// StopJobWithRetry stops a job with retry increment and frees capacity.
+func (q *PoolQueue) StopJobWithRetry(ctx context.Context, jobID string, errorMsg string) error {
+	q.logger.Debug("StopJobWithRetry", "jobID", jobID, "errorMsg", errorMsg)
+	// Get job before stopping
+	job, err := q.backend.GetJob(ctx, jobID)
+	if err != nil {
+		q.logger.Debug("StopJobWithRetry: GetJob error", "jobID", jobID, "error", err)
+		return err
+	}
+	q.logger.Debug("StopJobWithRetry", "jobID", jobID, "currentStatus", job.Status, "assigneeID", job.AssigneeID, "tags", job.Tags)
+
+	// Stop job with retry in backend
+	freedAssigneeIDs, err := q.backend.StopJobWithRetry(ctx, jobID, errorMsg)
+	if err != nil {
+		q.logger.Debug("StopJobWithRetry: backend.StopJobWithRetry error", "jobID", jobID, "error", err)
+		return err
+	}
+	q.logger.Debug("StopJobWithRetry: backend.StopJobWithRetry returned freedAssigneeIDs", "freedAssigneeIDs", freedAssigneeIDs, "jobID", jobID)
+
+	// Verify job state after backend operation
+	jobAfter, err := q.backend.GetJob(ctx, jobID)
+	if err != nil {
+		q.logger.Debug("StopJobWithRetry: GetJob after StopJobWithRetry error", "jobID", jobID, "error", err)
+	} else {
+		q.logger.Debug("StopJobWithRetry: status after StopJobWithRetry", "jobID", jobID, "status", jobAfter.Status)
+	}
+
+	// Free capacity for affected subscriptions
+	q.freeCapacityAndNotify(freedAssigneeIDs, job.Tags)
+
+	return nil
+}
+
+// MarkJobUnknownStopped marks a job as unknown stopped and frees capacity.
+func (q *PoolQueue) MarkJobUnknownStopped(ctx context.Context, jobID string, errorMsg string) error {
+	q.logger.Debug("MarkJobUnknownStopped", "jobID", jobID, "errorMsg", errorMsg)
+	// Get job before marking
+	job, err := q.backend.GetJob(ctx, jobID)
+	if err != nil {
+		q.logger.Debug("MarkJobUnknownStopped: GetJob error", "jobID", jobID, "error", err)
+		return err
+	}
+	q.logger.Debug("MarkJobUnknownStopped", "jobID", jobID, "currentStatus", job.Status, "assigneeID", job.AssigneeID, "tags", job.Tags)
+
+	// Mark job in backend
+	freedAssigneeIDs, err := q.backend.MarkJobUnknownStopped(ctx, jobID, errorMsg)
+	if err != nil {
+		q.logger.Debug("MarkJobUnknownStopped: backend.MarkJobUnknownStopped error", "jobID", jobID, "error", err)
+		return err
+	}
+	q.logger.Debug("MarkJobUnknownStopped: backend.MarkJobUnknownStopped returned freedAssigneeIDs", "freedAssigneeIDs", freedAssigneeIDs, "jobID", jobID)
+
+	// Verify job state after backend operation
+	jobAfter, err := q.backend.GetJob(ctx, jobID)
+	if err != nil {
+		q.logger.Debug("MarkJobUnknownStopped: GetJob after MarkJobUnknownStopped error", "jobID", jobID, "error", err)
+	} else {
+		q.logger.Debug("MarkJobUnknownStopped: status after MarkJobUnknownStopped", "jobID", jobID, "status", jobAfter.Status)
+	}
+
+	// Free capacity for affected subscriptions
+	q.freeCapacityAndNotify(freedAssigneeIDs, job.Tags)
+
+	return nil
+}
+
+// freeCapacityAndNotify frees capacity for subscriptions and notifies them.
+func (q *PoolQueue) freeCapacityAndNotify(freedAssigneeIDs map[string]int, jobTags []string) {
+	q.logger.Debug("freeCapacityAndNotify", "freedAssigneeIDs", freedAssigneeIDs, "jobTags", jobTags)
+	if len(freedAssigneeIDs) == 0 {
+		// Still notify about eligible jobs even if no capacity was freed
+		q.logger.Debug("freeCapacityAndNotify: no capacity freed, notifying all workers")
+		q.notifyWorkers(jobTags)
+		return
+	}
+
+	q.mu.RLock()
+	subs := make([]*subscription, 0, len(q.subscriptions))
+	for _, sub := range q.subscriptions {
+		// Check if this subscription's assigneeID had capacity freed
+		if count, ok := freedAssigneeIDs[sub.assigneeID]; ok && count > 0 {
+			subs = append(subs, sub)
+			q.logger.Debug("freeCapacityAndNotify: found subscription", "assigneeID", sub.assigneeID, "subID", sub.id, "count", count)
 		}
+	}
+	q.mu.RUnlock()
+
+	q.logger.Debug("freeCapacityAndNotify: found matching subscriptions", "count", len(subs))
+
+	// Update capacity for affected subscriptions and notify them
+	for _, sub := range subs {
+		sub.mu.Lock()
+		count := freedAssigneeIDs[sub.assigneeID]
+		oldCapacity := sub.currentCapacity
+		sub.currentCapacity += count
+		if sub.currentCapacity > sub.maxCapacity {
+			sub.currentCapacity = sub.maxCapacity
+		}
+		hasCapacity := sub.currentCapacity > 0
+		newCapacity := sub.currentCapacity
+		// Note: We don't know which specific jobs were freed, so we can't remove them from assignedJobs
+		// This is acceptable - the map will grow but jobs will be cleaned up on subscription end
+		sub.mu.Unlock()
+
+		q.logger.Debug("freeCapacityAndNotify: updated capacity", "assigneeID", sub.assigneeID, "subID", sub.id, "oldCapacity", oldCapacity, "newCapacity", newCapacity, "hasCapacity", hasCapacity)
+
+		// Notify subscription if it has capacity (non-blocking)
+		if hasCapacity {
+			select {
+			case sub.notifyCh <- struct{}{}:
+				q.logger.Debug("freeCapacityAndNotify: sent notification", "assigneeID", sub.assigneeID, "subID", sub.id)
+			default:
+				q.logger.Debug("freeCapacityAndNotify: notification channel full", "assigneeID", sub.assigneeID, "subID", sub.id)
+				// Notification already pending
+			}
+		} else {
+			q.logger.Debug("freeCapacityAndNotify: no capacity, not notifying", "assigneeID", sub.assigneeID, "subID", sub.id)
+		}
+	}
+
+	// Also notify all subscriptions about eligible jobs (they may have capacity from other sources)
+	q.logger.Debug("freeCapacityAndNotify: calling notifyWorkers for all subscriptions")
+	q.notifyWorkers(jobTags)
+}
+
+// CancelJobs cancels jobs by tags and/or job IDs.
+func (q *PoolQueue) CancelJobs(ctx context.Context, tags []string, jobIDs []string) ([]string, []string, error) {
+	q.logger.Debug("CancelJobs", "tags", tags, "jobIDs", jobIDs)
+	cancelledByTags, cancelledByIDs, err := q.backend.CancelJobs(ctx, tags, jobIDs)
+	if err != nil {
+		q.logger.Debug("CancelJobs: backend error", "error", err)
+	} else {
+		q.logger.Debug("CancelJobs: completed", "cancelledByTags", cancelledByTags, "cancelledByIDs", cancelledByIDs)
+	}
+	return cancelledByTags, cancelledByIDs, err
+}
+
+// AcknowledgeCancellation handles cancellation acknowledgment.
+func (q *PoolQueue) AcknowledgeCancellation(ctx context.Context, jobID string, wasExecuting bool) error {
+	q.logger.Debug("AcknowledgeCancellation", "jobID", jobID, "wasExecuting", wasExecuting)
+	// Get job before acknowledgment
+	job, err := q.backend.GetJob(ctx, jobID)
+	if err != nil {
+		q.logger.Debug("AcknowledgeCancellation: GetJob error", "jobID", jobID, "error", err)
+		return err
+	}
+	q.logger.Debug("AcknowledgeCancellation", "jobID", jobID, "currentStatus", job.Status, "assigneeID", job.AssigneeID, "tags", job.Tags)
+
+	// Acknowledge in backend
+	err = q.backend.AcknowledgeCancellation(ctx, jobID, wasExecuting)
+	if err != nil {
+		q.logger.Debug("AcknowledgeCancellation: backend error", "jobID", jobID, "error", err)
+		return err
+	}
+	q.logger.Debug("AcknowledgeCancellation: backend successfully acknowledged cancellation", "jobID", jobID)
+
+	// Free capacity if job was executing
+	if wasExecuting {
+		freedAssigneeIDs := map[string]int{job.AssigneeID: 1}
+		q.logger.Debug("AcknowledgeCancellation: freeing capacity", "assigneeID", job.AssigneeID)
+		q.freeCapacityAndNotify(freedAssigneeIDs, job.Tags)
 	}
 
 	return nil
 }
 
-// CleanupExpiredJobs deletes completed jobs that are older than the specified TTL.
-// This helps prevent the database from growing indefinitely.
-// Only completed jobs are deleted; pending and running jobs are never deleted.
-func (q *PoolQueue) CleanupExpiredJobs(ctx context.Context, ttl time.Duration) error {
-	return q.backend.CleanupExpiredJobs(ctx, ttl)
-}
+// MarkWorkerUnresponsive marks all jobs for a worker as unresponsive.
+func (q *PoolQueue) MarkWorkerUnresponsive(ctx context.Context, assigneeID string) error {
+	q.logger.Debug("MarkWorkerUnresponsive", "assigneeID", assigneeID)
+	// Mark in backend
+	err := q.backend.MarkWorkerUnresponsive(ctx, assigneeID)
+	if err != nil {
+		q.logger.Debug("MarkWorkerUnresponsive: backend error", "assigneeID", assigneeID, "error", err)
+		return err
+	}
+	q.logger.Debug("MarkWorkerUnresponsive: successfully marked as unresponsive", "assigneeID", assigneeID)
 
-// DeleteJobs forcefully deletes jobs by tags and/or job IDs
-// This method validates that all jobs are in final states (COMPLETED, UNSCHEDULED, STOPPED, UNKNOWN_STOPPED)
-// before deletion. If any job is not in a final state, an error is returned.
-func (q *PoolQueue) DeleteJobs(ctx context.Context, tags []string, jobIDs []string) error {
-	return q.backend.DeleteJobs(ctx, tags, jobIDs)
+	// Free capacity for all subscriptions with this assigneeID
+	q.mu.RLock()
+	subs := make([]*subscription, 0)
+	for _, sub := range q.subscriptions {
+		if sub.assigneeID == assigneeID {
+			subs = append(subs, sub)
+		}
+	}
+	q.mu.RUnlock()
+
+	// Update capacity for affected subscriptions
+	for _, sub := range subs {
+		sub.mu.Lock()
+		// Reset capacity to max (all jobs for this worker are now unassigned)
+		sub.currentCapacity = sub.maxCapacity
+		// Clear assigned jobs tracking
+		sub.assignedJobs = make(map[string]bool)
+		sub.mu.Unlock()
+
+		// Notify subscription (non-blocking)
+		select {
+		case sub.notifyCh <- struct{}{}:
+		default:
+			// Notification already pending
+		}
+	}
+
+	// Notify all workers about newly eligible jobs
+	// Pass nil to notify all subscriptions regardless of tags, since we don't know
+	// which tags the newly eligible jobs have
+	q.notifyWorkers(nil)
+
+	return nil
 }
 
 // GetJob retrieves a job by ID.
-// Returns the job if found, or an error if the job doesn't exist.
 func (q *PoolQueue) GetJob(ctx context.Context, jobID string) (*Job, error) {
-	return q.backend.GetJob(ctx, jobID)
-}
-
-// CancelJobs cancels jobs by tags and/or job IDs (batch cancellation).
-// tags: Filter jobs by tags using AND logic (jobs must have ALL provided tags)
-// jobIDs: Specific job IDs to cancel
-// Both tags and jobIDs are processed (union of both sets)
-// Returns: (cancelledJobIDs []string, unknownJobIDs []string, error)
-// - cancelledJobIDs: Jobs that were successfully cancelled
-// - unknownJobIDs: Jobs that were not found or already completed
-func (q *PoolQueue) CancelJobs(ctx context.Context, tags []string, jobIDs []string) ([]string, []string, error) {
-	return q.backend.CancelJobs(ctx, tags, jobIDs)
-}
-
-// AcknowledgeCancellation handles cancellation acknowledgment from worker
-func (q *PoolQueue) AcknowledgeCancellation(ctx context.Context, jobID string, wasExecuting bool) error {
-	return q.backend.AcknowledgeCancellation(ctx, jobID, wasExecuting)
-}
-
-// MarkWorkerUnresponsive marks all jobs assigned to the given assigneeID as unresponsive.
-// This is called when a worker becomes unresponsive.
-// Jobs transition: RUNNING -> UNKNOWN_RETRY, CANCELLING -> UNKNOWN_STOPPED
-// UNKNOWN_RETRY jobs become eligible for scheduling again, so we notify StreamJobs.
-func (q *PoolQueue) MarkWorkerUnresponsive(ctx context.Context, assigneeID string) error {
-	err := q.backend.MarkWorkerUnresponsive(ctx, assigneeID)
+	job, err := q.backend.GetJob(ctx, jobID)
 	if err != nil {
+		q.logger.Debug("GetJob: error", "jobID", jobID, "error", err)
+	} else {
+		q.logger.Debug("GetJob", "jobID", jobID, "status", job.Status)
+	}
+	return job, err
+}
+
+// GetJobStats gets statistics for jobs matching tags.
+func (q *PoolQueue) GetJobStats(ctx context.Context, tags []string) (*JobStats, error) {
+	q.logger.Debug("GetJobStats", "tags", tags)
+	stats, err := q.backend.GetJobStats(ctx, tags)
+	if err != nil {
+		q.logger.Debug("GetJobStats: backend error", "error", err)
+	} else if stats != nil {
+		q.logger.Debug("GetJobStats: completed", "TotalJobs", stats.TotalJobs, "PendingJobs", stats.PendingJobs, "RunningJobs", stats.RunningJobs, "CompletedJobs", stats.CompletedJobs, "StoppedJobs", stats.StoppedJobs, "FailedJobs", stats.FailedJobs, "TotalRetries", stats.TotalRetries)
+	}
+	return stats, err
+}
+
+// CleanupExpiredJobs deletes completed jobs older than TTL.
+func (q *PoolQueue) CleanupExpiredJobs(ctx context.Context, ttl time.Duration) error {
+	q.logger.Debug("CleanupExpiredJobs", "ttl", ttl)
+	if ttl <= 0 {
+		q.logger.Debug("CleanupExpiredJobs: invalid ttl", "ttl", ttl)
+		return fmt.Errorf("ttl must be > 0, got %v", ttl)
+	}
+	err := q.backend.CleanupExpiredJobs(ctx, ttl)
+	if err != nil {
+		q.logger.Debug("CleanupExpiredJobs: backend error", "error", err)
+	} else {
+		q.logger.Debug("CleanupExpiredJobs: successfully cleaned up expired jobs")
+	}
+	return err
+}
+
+// ResetRunningJobs resets all running jobs to unknown retry.
+func (q *PoolQueue) ResetRunningJobs(ctx context.Context) error {
+	q.logger.Debug("ResetRunningJobs: starting")
+	err := q.backend.ResetRunningJobs(ctx)
+	if err != nil {
+		q.logger.Debug("ResetRunningJobs: backend error", "error", err)
 		return err
 	}
-	// Notify StreamJobs that jobs may have become eligible (UNKNOWN_RETRY jobs)
-	// We notify all waiting workers since we don't know which tags the jobs have
-	// Pass nil tags to notify all waiting workers
-	q.notifyWaitingWorkers(nil)
+	q.logger.Debug("ResetRunningJobs: successfully reset all running jobs")
+
+	// Per spec (queue.md lines 436-439): Workers with matching tags notified when jobs become eligible
+	// Since we don't know which tags are affected, notify all workers
+	q.logger.Debug("ResetRunningJobs: notifying all workers about newly eligible jobs")
+	q.notifyWorkers(nil)
+
 	return nil
 }
 
-// Close closes the backend connection and releases any resources.
-// This should be called when the queue is no longer needed.
-// After closing, the queue should not be used.
-// It also cancels all active StreamJobs waiters to ensure clean shutdown.
+// DeleteJobs deletes jobs by tags and/or job IDs.
+func (q *PoolQueue) DeleteJobs(ctx context.Context, tags []string, jobIDs []string) error {
+	q.logger.Debug("DeleteJobs", "tags", tags, "jobIDs", jobIDs)
+	err := q.backend.DeleteJobs(ctx, tags, jobIDs)
+	if err != nil {
+		q.logger.Debug("DeleteJobs: backend error", "error", err)
+	} else {
+		q.logger.Debug("DeleteJobs: successfully deleted jobs")
+	}
+	return err
+}
+
+// UpdateJobStatus updates a job's status, result, and error message.
+func (q *PoolQueue) UpdateJobStatus(ctx context.Context, jobID string, status JobStatus, result []byte, errorMsg string) error {
+	q.logger.Debug("UpdateJobStatus", "jobID", jobID, "status", status)
+	// Get job before update to get tags for notification
+	job, err := q.backend.GetJob(ctx, jobID)
+	if err != nil {
+		q.logger.Debug("UpdateJobStatus: GetJob error", "jobID", jobID, "error", err)
+		return err
+	}
+	jobTags := job.Tags
+
+	// Update job in backend
+	freedAssigneeIDs, err := q.backend.UpdateJobStatus(ctx, jobID, status, result, errorMsg)
+	if err != nil {
+		q.logger.Debug("UpdateJobStatus: backend.UpdateJobStatus error", "jobID", jobID, "error", err)
+		return err
+	}
+	q.logger.Debug("UpdateJobStatus: backend.UpdateJobStatus returned freedAssigneeIDs", "freedAssigneeIDs", freedAssigneeIDs, "jobID", jobID)
+
+	// Free capacity for affected subscriptions and notify
+	q.freeCapacityAndNotify(freedAssigneeIDs, jobTags)
+
+	return nil
+}
+
+// Close closes the queue and all active StreamJobs calls.
 func (q *PoolQueue) Close() error {
-	// Cancel all active StreamJobs waiters to ensure clean shutdown
-	q.streamMu.Lock()
-	waiters := make([]*streamWaiter, 0, len(q.streamWaiters))
-	for _, waiter := range q.streamWaiters {
-		waiters = append(waiters, waiter)
+	q.mu.Lock()
+	if q.closed {
+		q.mu.Unlock()
+		return nil
 	}
-	q.streamWaiters = make(map[string]*streamWaiter) // Clear all waiters
-	q.streamMu.Unlock()
-
-	// Close all notification channels to wake up waiting StreamJobs
-	// This will cause them to exit when they check ctx.Done()
-	for _, waiter := range waiters {
-		close(waiter.notifyCh)
+	q.closed = true
+	close(q.closeCh)
+	// Build defensive copy of subscriptions to release lock quickly
+	// (not used, but prevents holding lock during backend.Close())
+	subs := make([]*subscription, 0, len(q.subscriptions))
+	for _, sub := range q.subscriptions {
+		subs = append(subs, sub)
 	}
+	_ = subs // Intentionally unused - defensive copy to release lock
+	q.mu.Unlock()
 
+	// Close all subscription channels
+	// Note: StreamJobs will close the channels when it detects queue closure
+	// We don't close them here to avoid double-close issues
+
+	// Close backend
 	return q.backend.Close()
 }

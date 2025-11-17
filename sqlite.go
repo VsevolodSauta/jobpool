@@ -7,6 +7,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"log/slog"
 	"time"
 
 	_ "github.com/mattn/go-sqlite3"
@@ -15,13 +16,15 @@ import (
 // SQLiteBackend implements the Backend interface using SQLite.
 // It provides ACID transactions and is suitable for single-server deployments.
 type SQLiteBackend struct {
-	db *sql.DB
+	db     *sql.DB
+	logger *slog.Logger
 }
 
 // NewSQLiteBackend creates a new SQLite backend.
 // The database file will be created if it doesn't exist.
 // dbPath is the path to the SQLite database file.
-func NewSQLiteBackend(dbPath string) (*SQLiteBackend, error) {
+// logger is used for structured logging (currently unused but kept for consistency with other backends).
+func NewSQLiteBackend(dbPath string, logger *slog.Logger) (*SQLiteBackend, error) {
 	db, err := sql.Open("sqlite3", dbPath+"?_foreign_keys=on")
 	if err != nil {
 		return nil, fmt.Errorf("failed to open database: %w", err)
@@ -31,7 +34,10 @@ func NewSQLiteBackend(dbPath string) (*SQLiteBackend, error) {
 		return nil, fmt.Errorf("failed to ping database: %w", err)
 	}
 
-	backend := &SQLiteBackend{db: db}
+	backend := &SQLiteBackend{
+		db:     db,
+		logger: logger,
+	}
 
 	// Initialize schema
 	if err := backend.initSchema(); err != nil {
@@ -56,7 +62,7 @@ func (b *SQLiteBackend) initSchema() error {
 		job_definition BLOB NOT NULL,
 		created_at INTEGER NOT NULL,
 		started_at INTEGER,
-		completed_at INTEGER,
+		finalized_at INTEGER,
 		error_message TEXT,
 		result BLOB,
 		retry_count INTEGER DEFAULT 0,
@@ -91,11 +97,11 @@ func (b *SQLiteBackend) EnqueueJob(ctx context.Context, job *Job) (string, error
 	}
 	defer tx.Rollback()
 
-	// Insert job
+	// Insert or replace job (handles re-enqueueing existing jobs)
 	_, err = tx.ExecContext(ctx, `
-		INSERT INTO jobs (id, status, job_type, job_definition, created_at, retry_count, assignee_id, assigned_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-	`, job.ID, job.Status, job.JobType, job.JobDefinition, job.CreatedAt.Unix(), job.RetryCount, job.AssigneeID, nil)
+		INSERT OR REPLACE INTO jobs (id, status, job_type, job_definition, created_at, retry_count, assignee_id, assigned_at, started_at, finalized_at, error_message, result, last_retry_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, job.ID, job.Status, job.JobType, job.JobDefinition, job.CreatedAt.Unix(), job.RetryCount, job.AssigneeID, nil, nil, nil, nil, nil, nil)
 	if err != nil {
 		return "", fmt.Errorf("failed to insert job: %w", err)
 	}
@@ -132,10 +138,10 @@ func (b *SQLiteBackend) EnqueueJobs(ctx context.Context, jobs []*Job) ([]string,
 
 	jobIDs := make([]string, 0, len(jobs))
 
-	// Insert jobs
+	// Insert or replace jobs (handles re-enqueueing existing jobs)
 	stmt, err := tx.PrepareContext(ctx, `
-		INSERT INTO jobs (id, status, job_type, job_definition, created_at, retry_count, assignee_id, assigned_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+		INSERT OR REPLACE INTO jobs (id, status, job_type, job_definition, created_at, retry_count, assignee_id, assigned_at, started_at, finalized_at, error_message, result, last_retry_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`)
 	if err != nil {
 		return nil, fmt.Errorf("failed to prepare statement: %w", err)
@@ -143,7 +149,7 @@ func (b *SQLiteBackend) EnqueueJobs(ctx context.Context, jobs []*Job) ([]string,
 	defer stmt.Close()
 
 	for _, job := range jobs {
-		_, err = stmt.ExecContext(ctx, job.ID, job.Status, job.JobType, job.JobDefinition, job.CreatedAt.Unix(), job.RetryCount, job.AssigneeID, nil)
+		_, err = stmt.ExecContext(ctx, job.ID, job.Status, job.JobType, job.JobDefinition, job.CreatedAt.Unix(), job.RetryCount, job.AssigneeID, nil, nil, nil, nil, nil, nil)
 		if err != nil {
 			return nil, fmt.Errorf("failed to insert job: %w", err)
 		}
@@ -186,8 +192,8 @@ func (b *SQLiteBackend) DequeueJobs(ctx context.Context, assigneeID string, tags
 	defer tx.Rollback()
 
 	// First, select and update jobs atomically
-	// Select PENDING, FAILED, and UNKNOWN_RETRY jobs (UNKNOWN_STOPPED should not be scheduled)
-	// FAILED jobs are treated like PENDING during scheduling (can be assigned without state change)
+	// Select INITIAL_PENDING, FAILED_RETRY, and UNKNOWN_RETRY jobs (UNKNOWN_STOPPED should not be scheduled)
+	// FAILED_RETRY jobs are treated like INITIAL_PENDING during scheduling (can be assigned without state change)
 	now := time.Now().Unix()
 
 	// Build query with optional tag filtering
@@ -199,21 +205,21 @@ func (b *SQLiteBackend) DequeueJobs(ctx context.Context, assigneeID string, tags
 		// Use GROUP BY and HAVING to ensure all tags are present
 		query = `
 			SELECT j.id, j.status, j.job_type, j.job_definition, j.created_at, 
-			       j.started_at, j.completed_at, j.error_message, j.result, 
+			       j.started_at, j.finalized_at, j.error_message, j.result, 
 			       j.retry_count, j.last_retry_at, j.assignee_id, j.assigned_at
 			FROM jobs j
 			INNER JOIN job_tags jt ON j.id = jt.job_id
 			WHERE j.status IN (?, ?, ?)
 			  AND jt.tag IN (` + placeholdersStr(len(tags)) + `)
 			GROUP BY j.id, j.status, j.job_type, j.job_definition, j.created_at, 
-			         j.started_at, j.completed_at, j.error_message, j.result, 
+			         j.started_at, j.finalized_at, j.error_message, j.result, 
 			         j.retry_count, j.last_retry_at, j.assignee_id, j.assigned_at
 			HAVING COUNT(DISTINCT jt.tag) = ?
 			ORDER BY COALESCE(j.last_retry_at, j.created_at) ASC
 			LIMIT ?
 		`
 		args = make([]interface{}, 0, 3+len(tags)+2)
-		args = append(args, JobStatusPending, JobStatusFailed, JobStatusUnknownRetry)
+		args = append(args, JobStatusInitialPending, JobStatusFailedRetry, JobStatusUnknownRetry)
 		for _, tag := range tags {
 			args = append(args, tag)
 		}
@@ -222,14 +228,14 @@ func (b *SQLiteBackend) DequeueJobs(ctx context.Context, assigneeID string, tags
 		// No tag filtering
 		query = `
 			SELECT j.id, j.status, j.job_type, j.job_definition, j.created_at, 
-			       j.started_at, j.completed_at, j.error_message, j.result, 
+			       j.started_at, j.finalized_at, j.error_message, j.result, 
 			       j.retry_count, j.last_retry_at, j.assignee_id, j.assigned_at
 			FROM jobs j
 			WHERE j.status IN (?, ?, ?)
 			ORDER BY COALESCE(j.last_retry_at, j.created_at) ASC
 			LIMIT ?
 		`
-		args = []interface{}{JobStatusPending, JobStatusFailed, JobStatusUnknownRetry, limit}
+		args = []interface{}{JobStatusInitialPending, JobStatusFailedRetry, JobStatusUnknownRetry, limit}
 	}
 
 	rows, err := tx.QueryContext(ctx, query, args...)
@@ -263,7 +269,7 @@ func (b *SQLiteBackend) DequeueJobs(ctx context.Context, assigneeID string, tags
 		}
 		if completedAt.Valid {
 			t := time.Unix(completedAt.Int64, 0)
-			job.CompletedAt = &t
+			job.FinalizedAt = &t
 		}
 		if lastRetryAt.Valid {
 			t := time.Unix(lastRetryAt.Int64, 0)
@@ -316,13 +322,14 @@ func (b *SQLiteBackend) DequeueJobs(ctx context.Context, assigneeID string, tags
 		return nil, fmt.Errorf("failed to commit transaction: %w", err)
 	}
 
-	// Load tags for all jobs
+	// Load tags for all jobs and update status to RUNNING
 	for _, job := range jobs {
 		tags, err := b.getJobTags(ctx, job.ID)
 		if err != nil {
 			return nil, fmt.Errorf("failed to get tags for job %s: %w", job.ID, err)
 		}
 		job.Tags = tags
+		job.Status = JobStatusRunning
 		job.AssigneeID = assigneeID
 		assignedTime := time.Unix(now, 0)
 		job.AssignedAt = &assignedTime
@@ -357,7 +364,7 @@ func (b *SQLiteBackend) getJobTags(ctx context.Context, jobID string) ([]string,
 
 // CompleteJob atomically transitions a job to COMPLETED with the given result.
 // Supports RUNNING, CANCELLING, UNKNOWN_RETRY, and UNKNOWN_STOPPED → COMPLETED transitions.
-func (b *SQLiteBackend) CompleteJob(ctx context.Context, jobID string, result []byte) ([]string, error) {
+func (b *SQLiteBackend) CompleteJob(ctx context.Context, jobID string, result []byte) (map[string]int, error) {
 	now := time.Now().Unix()
 
 	// Get current job to validate it's in a valid state and get assignee ID
@@ -377,10 +384,10 @@ func (b *SQLiteBackend) CompleteJob(ctx context.Context, jobID string, result []
 		return nil, fmt.Errorf("job %s is not in a valid state for completion (current: %s)", jobID, job.Status)
 	}
 
-	// Get freed assignee ID before clearing
-	freedAssigneeIDs := []string{}
+	// Get freed assignee ID before clearing (with count/multiplicity)
+	freedAssigneeIDs := make(map[string]int)
 	if job.AssigneeID != "" {
-		freedAssigneeIDs = []string{job.AssigneeID}
+		freedAssigneeIDs[job.AssigneeID] = 1
 	}
 
 	// Update to COMPLETED in a transaction
@@ -399,10 +406,8 @@ func (b *SQLiteBackend) CompleteJob(ctx context.Context, jobID string, result []
 		UPDATE jobs
 		SET status = ?,
 		    result = ?,
-		    completed_at = ?,
-		    started_at = COALESCE(?, started_at),
-		    assignee_id = NULL,
-		    assigned_at = NULL
+		    finalized_at = ?,
+		    started_at = COALESCE(?, started_at)
 		WHERE id = ? AND status IN (?, ?, ?, ?)
 	`, JobStatusCompleted, result, now, startedAt, jobID, JobStatusRunning, JobStatusCancelling, JobStatusUnknownRetry, JobStatusUnknownStopped)
 	if err != nil {
@@ -416,9 +421,10 @@ func (b *SQLiteBackend) CompleteJob(ctx context.Context, jobID string, result []
 	return freedAssigneeIDs, nil
 }
 
-// FailJob atomically transitions a job to FAILED, then to PENDING, incrementing the retry count.
-// Supports RUNNING and UNKNOWN_RETRY → FAILED → PENDING transitions.
-func (b *SQLiteBackend) FailJob(ctx context.Context, jobID string, errorMsg string) ([]string, error) {
+// FailJob atomically transitions a job to FAILED_RETRY, incrementing the retry count.
+// Supports RUNNING and UNKNOWN_RETRY → FAILED_RETRY transitions.
+// Job remains in FAILED_RETRY state (eligible for scheduling, but never returns to INITIAL_PENDING).
+func (b *SQLiteBackend) FailJob(ctx context.Context, jobID string, errorMsg string) (map[string]int, error) {
 	now := time.Now().Unix()
 
 	// Get current job to validate it's in a valid state and get assignee ID
@@ -427,49 +433,37 @@ func (b *SQLiteBackend) FailJob(ctx context.Context, jobID string, errorMsg stri
 		return nil, fmt.Errorf("failed to get job: %w", err)
 	}
 
-	// Validate job is in a state that can transition to FAILED
+	// Validate job is in a state that can transition to FAILED_RETRY
 	if job.Status != JobStatusRunning && job.Status != JobStatusUnknownRetry {
 		return nil, fmt.Errorf("job %s is not in RUNNING or UNKNOWN_RETRY state (current: %s)", jobID, job.Status)
 	}
 
-	// Get freed assignee ID before clearing
-	freedAssigneeIDs := []string{}
+	// Get freed assignee ID before clearing (with count/multiplicity)
+	freedAssigneeIDs := make(map[string]int)
 	if job.AssigneeID != "" {
-		freedAssigneeIDs = []string{job.AssigneeID}
+		freedAssigneeIDs[job.AssigneeID] = 1
 	}
 
-	// Atomic transaction: FAILED → PENDING with retry increment
-	// We do this in a single transaction, but the FAILED state is observable
-	// because we update status to FAILED first, then immediately to PENDING
+	// Atomic transaction: transition to FAILED_RETRY with retry increment
+	// Job stays in FAILED_RETRY state (eligible for scheduling, but never returns to INITIAL_PENDING)
 	tx, err := b.db.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed to begin transaction: %w", err)
 	}
 	defer tx.Rollback()
 
-	// First, update to FAILED with error message
+	// Update to FAILED_RETRY with error message, increment retry count, and clear assignee
+	// Job remains in FAILED_RETRY state (eligible for scheduling like INITIAL_PENDING, but never transitions back to INITIAL_PENDING)
 	_, err = tx.ExecContext(ctx, `
 		UPDATE jobs
 		SET status = ?,
-		    error_message = ?
+		    error_message = ?,
+		    retry_count = retry_count + 1,
+		    last_retry_at = ?
 		WHERE id = ? AND status IN (?, ?)
-	`, JobStatusFailed, errorMsg, jobID, JobStatusRunning, JobStatusUnknownRetry)
+	`, JobStatusFailedRetry, errorMsg, now, jobID, JobStatusRunning, JobStatusUnknownRetry)
 	if err != nil {
-		return nil, fmt.Errorf("failed to update job to FAILED: %w", err)
-	}
-
-	// Immediately increment retry count and set to PENDING
-	_, err = tx.ExecContext(ctx, `
-		UPDATE jobs
-		SET retry_count = retry_count + 1,
-		    last_retry_at = ?,
-		    status = ?,
-		    assignee_id = NULL,
-		    assigned_at = NULL
-		WHERE id = ? AND status = ?
-	`, now, JobStatusPending, jobID, JobStatusFailed)
-	if err != nil {
-		return nil, fmt.Errorf("failed to increment retry count: %w", err)
+		return nil, fmt.Errorf("failed to update job to FAILED_RETRY: %w", err)
 	}
 
 	if err := tx.Commit(); err != nil {
@@ -481,7 +475,7 @@ func (b *SQLiteBackend) FailJob(ctx context.Context, jobID string, errorMsg stri
 
 // StopJob atomically transitions a job to STOPPED with an error message.
 // Supports RUNNING, CANCELLING, and UNKNOWN_RETRY → STOPPED transitions.
-func (b *SQLiteBackend) StopJob(ctx context.Context, jobID string, errorMsg string) ([]string, error) {
+func (b *SQLiteBackend) StopJob(ctx context.Context, jobID string, errorMsg string) (map[string]int, error) {
 	now := time.Now().Unix()
 
 	// Get current job to validate it's in a valid state and get assignee ID
@@ -500,10 +494,10 @@ func (b *SQLiteBackend) StopJob(ctx context.Context, jobID string, errorMsg stri
 		return nil, fmt.Errorf("job %s is not in a valid state for stopping (current: %s)", jobID, job.Status)
 	}
 
-	// Get freed assignee ID before clearing
-	freedAssigneeIDs := []string{}
+	// Get freed assignee ID before clearing (with count/multiplicity)
+	freedAssigneeIDs := make(map[string]int)
 	if job.AssigneeID != "" {
-		freedAssigneeIDs = []string{job.AssigneeID}
+		freedAssigneeIDs[job.AssigneeID] = 1
 	}
 
 	// Update to STOPPED in a transaction
@@ -517,9 +511,7 @@ func (b *SQLiteBackend) StopJob(ctx context.Context, jobID string, errorMsg stri
 		UPDATE jobs
 		SET status = ?,
 		    error_message = ?,
-		    completed_at = COALESCE(completed_at, ?),
-		    assignee_id = NULL,
-		    assigned_at = NULL
+		    finalized_at = COALESCE(finalized_at, ?)
 		WHERE id = ? AND status IN (?, ?, ?)
 	`, JobStatusStopped, errorMsg, now, jobID, JobStatusRunning, JobStatusCancelling, JobStatusUnknownRetry)
 	if err != nil {
@@ -534,8 +526,8 @@ func (b *SQLiteBackend) StopJob(ctx context.Context, jobID string, errorMsg stri
 }
 
 // StopJobWithRetry atomically transitions a job from CANCELLING to STOPPED with retry increment.
-// Applies all effects from the transitory FAILED state (retry increment + error message).
-func (b *SQLiteBackend) StopJobWithRetry(ctx context.Context, jobID string, errorMsg string) ([]string, error) {
+// Applies all effects from the transitory FAILED_RETRY state (retry increment + error message).
+func (b *SQLiteBackend) StopJobWithRetry(ctx context.Context, jobID string, errorMsg string) (map[string]int, error) {
 	now := time.Now().Unix()
 
 	// Get current job to validate it's in CANCELLING state and get assignee ID
@@ -548,10 +540,10 @@ func (b *SQLiteBackend) StopJobWithRetry(ctx context.Context, jobID string, erro
 		return nil, fmt.Errorf("job %s is not in CANCELLING state (current: %s)", jobID, job.Status)
 	}
 
-	// Get freed assignee ID before clearing
-	freedAssigneeIDs := []string{}
+	// Get freed assignee ID before clearing (with count/multiplicity)
+	freedAssigneeIDs := make(map[string]int)
 	if job.AssigneeID != "" {
-		freedAssigneeIDs = []string{job.AssigneeID}
+		freedAssigneeIDs[job.AssigneeID] = 1
 	}
 
 	// Atomic transaction: CANCELLING → STOPPED with retry increment
@@ -567,9 +559,7 @@ func (b *SQLiteBackend) StopJobWithRetry(ctx context.Context, jobID string, erro
 		    error_message = ?,
 		    retry_count = retry_count + 1,
 		    last_retry_at = ?,
-		    completed_at = COALESCE(completed_at, ?),
-		    assignee_id = NULL,
-		    assigned_at = NULL
+		    finalized_at = COALESCE(finalized_at, ?)
 		WHERE id = ? AND status = ?
 	`, JobStatusStopped, errorMsg, now, now, jobID, JobStatusCancelling)
 	if err != nil {
@@ -585,7 +575,7 @@ func (b *SQLiteBackend) StopJobWithRetry(ctx context.Context, jobID string, erro
 
 // MarkJobUnknownStopped atomically transitions a job to UNKNOWN_STOPPED with an error message.
 // Supports CANCELLING, UNKNOWN_RETRY, and RUNNING → UNKNOWN_STOPPED transitions.
-func (b *SQLiteBackend) MarkJobUnknownStopped(ctx context.Context, jobID string, errorMsg string) ([]string, error) {
+func (b *SQLiteBackend) MarkJobUnknownStopped(ctx context.Context, jobID string, errorMsg string) (map[string]int, error) {
 	now := time.Now().Unix()
 
 	// Get current job to get assignee ID before clearing
@@ -594,10 +584,10 @@ func (b *SQLiteBackend) MarkJobUnknownStopped(ctx context.Context, jobID string,
 		return nil, fmt.Errorf("failed to get job: %w", err)
 	}
 
-	// Get freed assignee ID before clearing
-	freedAssigneeIDs := []string{}
+	// Get freed assignee ID before clearing (with count/multiplicity)
+	freedAssigneeIDs := make(map[string]int)
 	if job.AssigneeID != "" {
-		freedAssigneeIDs = []string{job.AssigneeID}
+		freedAssigneeIDs[job.AssigneeID] = 1
 	}
 
 	// Update to UNKNOWN_STOPPED in a transaction
@@ -611,9 +601,7 @@ func (b *SQLiteBackend) MarkJobUnknownStopped(ctx context.Context, jobID string,
 		UPDATE jobs
 		SET status = ?,
 		    error_message = ?,
-		    completed_at = COALESCE(completed_at, ?),
-		    assignee_id = NULL,
-		    assigned_at = NULL
+		    finalized_at = COALESCE(finalized_at, ?)
 		WHERE id = ? AND status IN (?, ?, ?)
 	`, JobStatusUnknownStopped, errorMsg, now, jobID, JobStatusCancelling, JobStatusUnknownRetry, JobStatusRunning)
 	if err != nil {
@@ -629,7 +617,7 @@ func (b *SQLiteBackend) MarkJobUnknownStopped(ctx context.Context, jobID string,
 
 // UpdateJobStatus updates a job's status, result, and error message.
 // This is a generic method for edge cases not covered by atomic methods.
-func (b *SQLiteBackend) UpdateJobStatus(ctx context.Context, jobID string, status JobStatus, result []byte, errorMsg string) ([]string, error) {
+func (b *SQLiteBackend) UpdateJobStatus(ctx context.Context, jobID string, status JobStatus, result []byte, errorMsg string) (map[string]int, error) {
 	now := time.Now().Unix()
 
 	// Get current job to check if it exists and get assignee ID
@@ -638,12 +626,12 @@ func (b *SQLiteBackend) UpdateJobStatus(ctx context.Context, jobID string, statu
 		return nil, fmt.Errorf("failed to get job: %w", err)
 	}
 
-	// Get freed assignee ID if transitioning from RUNNING to terminal state
-	freedAssigneeIDs := []string{}
+	// Get freed assignee ID if transitioning from RUNNING to terminal state (with count/multiplicity)
+	freedAssigneeIDs := make(map[string]int)
 	wasRunning := job.Status == JobStatusRunning
 	isTerminal := status == JobStatusCompleted || status == JobStatusStopped || status == JobStatusUnknownStopped
 	if wasRunning && isTerminal && job.AssigneeID != "" {
-		freedAssigneeIDs = []string{job.AssigneeID}
+		freedAssigneeIDs[job.AssigneeID] = 1
 	}
 
 	// Update job status in a transaction
@@ -673,7 +661,7 @@ func (b *SQLiteBackend) UpdateJobStatus(ctx context.Context, jobID string, statu
 	}
 
 	if status == JobStatusCompleted || status == JobStatusStopped || status == JobStatusUnknownStopped {
-		if job.CompletedAt == nil {
+		if job.FinalizedAt == nil {
 			completedAt = sql.NullInt64{Int64: now, Valid: true}
 		}
 	}
@@ -701,7 +689,7 @@ func (b *SQLiteBackend) UpdateJobStatus(ctx context.Context, jobID string, statu
 		    result = COALESCE(?, result),
 		    error_message = COALESCE(?, error_message),
 		    started_at = COALESCE(?, started_at),
-		    completed_at = COALESCE(?, completed_at),
+		    finalized_at = COALESCE(?, finalized_at),
 		    assignee_id = ?,
 		    assigned_at = ?
 		WHERE id = ?
@@ -719,36 +707,44 @@ func (b *SQLiteBackend) UpdateJobStatus(ctx context.Context, jobID string, statu
 
 // GetJobStats gets statistics for jobs matching ALL provided tags (AND logic)
 func (b *SQLiteBackend) GetJobStats(ctx context.Context, tags []string) (*JobStats, error) {
+	var query string
+	var args []interface{}
+
 	if len(tags) == 0 {
-		return &JobStats{
-			Tags:          tags,
-			TotalJobs:     0,
-			PendingJobs:   0,
-			RunningJobs:   0,
-			CompletedJobs: 0,
-			FailedJobs:    0,
-			TotalRetries:  0,
-		}, nil
+		// When tags are empty, return stats for all jobs
+		query = `
+			SELECT 
+				j.status,
+				COUNT(DISTINCT j.id) as count,
+				SUM(j.retry_count) as total_retries
+			FROM jobs j
+			GROUP BY j.status
+		`
+		args = []interface{}{}
+	} else {
+		// Build query with AND logic: jobs must have ALL tags
+		// Use subquery to find jobs with all tags, then aggregate by status
+		query = `
+			SELECT 
+				j.status,
+				COUNT(DISTINCT j.id) as count,
+				SUM(j.retry_count) as total_retries
+			FROM jobs j
+			WHERE j.id IN (
+				SELECT jt.job_id
+				FROM job_tags jt
+				WHERE jt.tag IN (` + placeholdersStr(len(tags)) + `)
+				GROUP BY jt.job_id
+				HAVING COUNT(DISTINCT jt.tag) = ?
+			)
+			GROUP BY j.status
+		`
+		args = make([]interface{}, 0, len(tags)+1)
+		for _, tag := range tags {
+			args = append(args, tag)
+		}
+		args = append(args, len(tags))
 	}
-
-	// Build query with AND logic: jobs must have ALL tags
-	query := `
-		SELECT 
-			j.status,
-			COUNT(DISTINCT j.id) as count,
-			SUM(j.retry_count) as total_retries
-		FROM jobs j
-		INNER JOIN job_tags jt ON j.id = jt.job_id
-		WHERE jt.tag IN (` + placeholdersStr(len(tags)) + `)
-		GROUP BY j.id, j.status
-		HAVING COUNT(DISTINCT jt.tag) = ?
-	`
-
-	args := make([]interface{}, 0, len(tags)+1)
-	for _, tag := range tags {
-		args = append(args, tag)
-	}
-	args = append(args, len(tags))
 
 	rows, err := b.db.QueryContext(ctx, query, args...)
 	if err != nil {
@@ -778,13 +774,13 @@ func (b *SQLiteBackend) GetJobStats(ctx context.Context, tags []string) (*JobSta
 		stats.TotalRetries += totalRetries
 
 		switch status {
-		case JobStatusPending:
+		case JobStatusInitialPending:
 			stats.PendingJobs += count
 		case JobStatusRunning:
 			stats.RunningJobs += count
 		case JobStatusCompleted:
 			stats.CompletedJobs += count
-		case JobStatusFailed:
+		case JobStatusFailedRetry:
 			stats.FailedJobs += count
 		}
 	}
@@ -829,7 +825,7 @@ func (b *SQLiteBackend) CleanupExpiredJobs(ctx context.Context, ttl time.Duratio
 	cutoff := time.Now().Add(-ttl).Unix()
 	_, err := b.db.ExecContext(ctx, `
 		DELETE FROM jobs
-		WHERE status = ? AND completed_at IS NOT NULL AND completed_at < ?
+		WHERE status = ? AND finalized_at IS NOT NULL AND finalized_at < ?
 	`, JobStatusCompleted, cutoff)
 	if err != nil {
 		return fmt.Errorf("failed to cleanup expired jobs: %w", err)
@@ -957,7 +953,7 @@ func (b *SQLiteBackend) GetJob(ctx context.Context, jobID string) (*Job, error) 
 
 	err := b.db.QueryRowContext(ctx, `
 		SELECT id, status, job_type, job_definition, created_at,
-		       started_at, completed_at, error_message, result,
+		       started_at, finalized_at, error_message, result,
 		       retry_count, last_retry_at, assignee_id, assigned_at
 		FROM jobs
 		WHERE id = ?
@@ -980,7 +976,7 @@ func (b *SQLiteBackend) GetJob(ctx context.Context, jobID string) (*Job, error) 
 	}
 	if completedAt.Valid {
 		t := time.Unix(completedAt.Int64, 0)
-		job.CompletedAt = &t
+		job.FinalizedAt = &t
 	}
 	if lastRetryAt.Valid {
 		t := time.Unix(lastRetryAt.Int64, 0)
@@ -1094,12 +1090,12 @@ func (b *SQLiteBackend) CancelJobs(ctx context.Context, tags []string, jobIDs []
 
 		// Determine new status based on current status
 		var newStatus JobStatus
-		if job.Status == JobStatusPending {
+		if job.Status == JobStatusInitialPending {
 			newStatus = JobStatusUnscheduled
 		} else if job.Status == JobStatusRunning {
 			newStatus = JobStatusCancelling
-		} else if job.Status == JobStatusFailed {
-			// FAILED jobs can be cancelled to STOPPED
+		} else if job.Status == JobStatusFailedRetry {
+			// FAILED_RETRY jobs can be cancelled to STOPPED
 			newStatus = JobStatusStopped
 		} else if job.Status == JobStatusUnknownRetry {
 			// UNKNOWN_RETRY jobs can be cancelled to STOPPED
@@ -1111,17 +1107,17 @@ func (b *SQLiteBackend) CancelJobs(ctx context.Context, tags []string, jobIDs []
 		}
 
 		// Update job status
-		// For FAILED and UNKNOWN_RETRY jobs transitioning to STOPPED, set completed_at
+		// For FAILED_RETRY and UNKNOWN_RETRY jobs transitioning to STOPPED, set finalized_at
 		now := time.Now().Unix()
 		var completedAt sql.NullInt64
-		if newStatus == JobStatusStopped && (job.Status == JobStatusFailed || job.Status == JobStatusUnknownRetry) {
+		if newStatus == JobStatusStopped && (job.Status == JobStatusFailedRetry || job.Status == JobStatusUnknownRetry) {
 			completedAt = sql.NullInt64{Int64: now, Valid: true}
 		}
 
 		_, err = b.db.ExecContext(ctx, `
 			UPDATE jobs
 			SET status = ?,
-			    completed_at = COALESCE(?, completed_at)
+			    finalized_at = COALESCE(?, finalized_at)
 			WHERE id = ?
 		`, newStatus, completedAt, jobID)
 		if err != nil {
@@ -1147,11 +1143,10 @@ func (b *SQLiteBackend) MarkWorkerUnresponsive(ctx context.Context, assigneeID s
 	defer tx.Rollback()
 
 	// Update RUNNING jobs to UNKNOWN_RETRY
+	// Note: AssigneeID and AssignedAt are preserved for historical tracking (per spec)
 	_, err = tx.ExecContext(ctx, `
 		UPDATE jobs
-		SET status = ?,
-		    assignee_id = NULL,
-		    assigned_at = NULL
+		SET status = ?
 		WHERE assignee_id = ? AND status = ?
 	`, JobStatusUnknownRetry, assigneeID, JobStatusRunning)
 	if err != nil {
@@ -1159,13 +1154,12 @@ func (b *SQLiteBackend) MarkWorkerUnresponsive(ctx context.Context, assigneeID s
 	}
 
 	// Update CANCELLING jobs to UNKNOWN_STOPPED
+	// Note: AssigneeID and AssignedAt are preserved for historical tracking (per spec)
 	now := time.Now().Unix()
 	_, err = tx.ExecContext(ctx, `
 		UPDATE jobs
 		SET status = ?,
-		    completed_at = COALESCE(completed_at, ?),
-		    assignee_id = NULL,
-		    assigned_at = NULL
+		    finalized_at = COALESCE(finalized_at, ?)
 		WHERE assignee_id = ? AND status = ?
 	`, JobStatusUnknownStopped, now, assigneeID, JobStatusCancelling)
 	if err != nil {
@@ -1204,7 +1198,7 @@ func (b *SQLiteBackend) AcknowledgeCancellation(ctx context.Context, jobID strin
 	_, err = b.db.ExecContext(ctx, `
 		UPDATE jobs
 		SET status = ?,
-		    completed_at = COALESCE(completed_at, ?),
+		    finalized_at = COALESCE(finalized_at, ?),
 		    assignee_id = NULL,
 		    assigned_at = NULL
 		WHERE id = ? AND status = ?
@@ -1228,12 +1222,12 @@ func placeholdersStr(n int) string {
 	return result
 }
 
-// SetJobCompletedAtForTesting sets the completed_at timestamp for a job (test helper only)
+// SetJobFinalizedAtForTesting sets the finalized_at timestamp for a job (test helper only)
 // This is used in tests to simulate jobs completed at different times
-func (b *SQLiteBackend) SetJobCompletedAtForTesting(ctx context.Context, jobID string, completedAt time.Time) error {
+func (b *SQLiteBackend) SetJobFinalizedAtForTesting(ctx context.Context, jobID string, completedAt time.Time) error {
 	_, err := b.db.ExecContext(ctx, `
 		UPDATE jobs
-		SET completed_at = ?
+		SET finalized_at = ?
 		WHERE id = ?
 	`, completedAt.Unix(), jobID)
 	return err

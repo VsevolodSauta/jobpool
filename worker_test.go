@@ -21,19 +21,19 @@ func TestWorker_ProcessJobs(t *testing.T) {
 	tmpFile.Close()
 	defer os.Remove(tmpFile.Name())
 
-	backend, err := jobpool.NewSQLiteBackend(tmpFile.Name())
+	backend, err := jobpool.NewSQLiteBackend(tmpFile.Name(), testLogger())
 	if err != nil {
 		t.Fatalf("Failed to create SQLite backend: %v", err)
 	}
 	defer backend.Close()
 
-	queue := jobpool.NewPoolQueue(backend)
+	queue := jobpool.NewPoolQueue(backend, testLogger())
 	ctx := context.Background()
 
 	// Enqueue a job
 	job := &jobpool.Job{
 		ID:            "job-1",
-		Status:        jobpool.JobStatusPending,
+		Status:        jobpool.JobStatusInitialPending,
 		JobType:       "test",
 		JobDefinition: []byte("test data"),
 		Tags:          []string{"tag1"},
@@ -59,7 +59,7 @@ func TestWorker_ProcessJobs(t *testing.T) {
 	}
 
 	assigneeID := "test-worker"
-	worker := jobpool.NewWorker(queue, processor, config, assigneeID)
+	worker := jobpool.NewWorker(queue, processor, config, assigneeID, testLogger())
 
 	// Start worker
 	if err := worker.Start(ctx); err != nil {
@@ -100,19 +100,19 @@ func TestWorker_RetryFailedJobs(t *testing.T) {
 	tmpFile.Close()
 	defer os.Remove(tmpFile.Name())
 
-	backend, err := jobpool.NewSQLiteBackend(tmpFile.Name())
+	backend, err := jobpool.NewSQLiteBackend(tmpFile.Name(), testLogger())
 	if err != nil {
 		t.Fatalf("Failed to create SQLite backend: %v", err)
 	}
 	defer backend.Close()
 
-	queue := jobpool.NewPoolQueue(backend)
+	queue := jobpool.NewPoolQueue(backend, testLogger())
 	ctx := context.Background()
 
 	// Enqueue a job
 	job := &jobpool.Job{
 		ID:            "job-1",
-		Status:        jobpool.JobStatusPending,
+		Status:        jobpool.JobStatusInitialPending,
 		JobType:       "test",
 		JobDefinition: []byte("test data"),
 		Tags:          []string{"tag1"},
@@ -141,7 +141,7 @@ func TestWorker_RetryFailedJobs(t *testing.T) {
 	}
 
 	assigneeID := "test-worker"
-	worker := jobpool.NewWorker(queue, processor, config, assigneeID)
+	worker := jobpool.NewWorker(queue, processor, config, assigneeID, testLogger())
 
 	// Start worker
 	if err := worker.Start(ctx); err != nil {

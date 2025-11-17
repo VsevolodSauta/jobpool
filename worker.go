@@ -3,7 +3,7 @@ package jobpool
 import (
 	"context"
 	"fmt"
-	"log"
+	"log/slog"
 	"time"
 )
 
@@ -18,6 +18,7 @@ type Worker struct {
 	queue      Queue
 	processor  JobProcessor
 	config     *Config
+	logger     *slog.Logger
 	stopCh     chan struct{}
 	doneCh     chan struct{}
 	assigneeID string
@@ -30,12 +31,14 @@ type Worker struct {
 // processor is the function that will process each job.
 // config contains worker configuration (TTL, cleanup interval, batch size).
 // assigneeID is a unique identifier for this worker (used for job assignment tracking).
-func NewWorker(queue Queue, processor JobProcessor, config *Config, assigneeID string) *Worker {
+// logger is the logger instance for logging worker operations.
+func NewWorker(queue Queue, processor JobProcessor, config *Config, assigneeID string, logger *slog.Logger) *Worker {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &Worker{
 		queue:      queue,
 		processor:  processor,
 		config:     config,
+		logger:     logger,
 		stopCh:     make(chan struct{}),
 		doneCh:     make(chan struct{}),
 		assigneeID: assigneeID,
@@ -110,7 +113,7 @@ func (w *Worker) processBatch(ctx context.Context) {
 	go func() {
 		defer close(streamDone)
 		if err := w.queue.StreamJobs(w.ctx, w.assigneeID, nil, w.config.BatchSize, jobCh); err != nil {
-			log.Printf("[Worker] Failed to stream jobs: %v", err)
+			w.logger.Error("Failed to stream jobs", "error", err)
 		}
 	}()
 
@@ -144,16 +147,16 @@ func (w *Worker) processJob(ctx context.Context, job *Job) {
 	// Process the job
 	result, err := w.processor(ctx, job)
 	if err != nil {
-		// Job failed - FailJob handles FAILED → PENDING transition with retry increment
+		// Job failed - FailJob handles FAILED_RETRY → INITIAL_PENDING transition with retry increment
 		if failErr := w.queue.FailJob(ctx, job.ID, err.Error()); failErr != nil {
-			log.Printf("[Worker] Failed to mark job as failed: %v", failErr)
+			w.logger.Error("Failed to mark job as failed", "jobID", job.ID, "error", failErr)
 		}
 		return
 	}
 
 	// Job succeeded - update status to completed
 	if err := w.queue.CompleteJob(ctx, job.ID, result); err != nil {
-		log.Printf("[Worker] Failed to mark job as completed: %v", err)
+		w.logger.Error("Failed to mark job as completed", "jobID", job.ID, "error", err)
 		return
 	}
 }
@@ -179,7 +182,7 @@ func (w *Worker) cleanupLoop(ctx context.Context) {
 // cleanup performs cleanup of expired jobs
 func (w *Worker) cleanup(ctx context.Context) {
 	if err := w.queue.CleanupExpiredJobs(ctx, w.config.TTL); err != nil {
-		log.Printf("[Worker] Failed to cleanup expired jobs: %v", err)
+		w.logger.Error("Failed to cleanup expired jobs", "error", err)
 		return
 	}
 }

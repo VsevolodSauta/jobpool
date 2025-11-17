@@ -31,10 +31,10 @@ var _ = Describe("DeleteJobs", func() {
 		Expect(err).NotTo(HaveOccurred())
 		tmpFile.Close()
 
-		backend, err = jobpool.NewSQLiteBackend(tmpFile.Name())
+		backend, err = jobpool.NewSQLiteBackend(tmpFile.Name(), testLogger())
 		Expect(err).NotTo(HaveOccurred())
 
-		queue = jobpool.NewPoolQueue(backend)
+		queue = jobpool.NewPoolQueue(backend, testLogger())
 	})
 
 	AfterEach(func() {
@@ -52,7 +52,7 @@ var _ = Describe("DeleteJobs", func() {
 				// Given: A completed job
 				job := &jobpool.Job{
 					ID:            "job-completed-1",
-					Status:        jobpool.JobStatusPending,
+					Status:        jobpool.JobStatusInitialPending,
 					JobType:       "test",
 					JobDefinition: []byte("test"),
 					CreatedAt:     time.Now(),
@@ -80,7 +80,7 @@ var _ = Describe("DeleteJobs", func() {
 				// Given: An unscheduled job (cancelled before assignment)
 				job := &jobpool.Job{
 					ID:            "job-unscheduled-1",
-					Status:        jobpool.JobStatusPending,
+					Status:        jobpool.JobStatusInitialPending,
 					JobType:       "test",
 					JobDefinition: []byte("test"),
 					CreatedAt:     time.Now(),
@@ -110,7 +110,7 @@ var _ = Describe("DeleteJobs", func() {
 				// Given: A stopped job (cancelled while running)
 				job := &jobpool.Job{
 					ID:            "job-stopped-1",
-					Status:        jobpool.JobStatusPending,
+					Status:        jobpool.JobStatusInitialPending,
 					JobType:       "test",
 					JobDefinition: []byte("test"),
 					CreatedAt:     time.Now(),
@@ -137,7 +137,7 @@ var _ = Describe("DeleteJobs", func() {
 				// Given: An unknown_stopped job
 				job := &jobpool.Job{
 					ID:            "job-unknown-stopped-1",
-					Status:        jobpool.JobStatusPending,
+					Status:        jobpool.JobStatusInitialPending,
 					JobType:       "test",
 					JobDefinition: []byte("test"),
 					CreatedAt:     time.Now(),
@@ -165,7 +165,7 @@ var _ = Describe("DeleteJobs", func() {
 				// Create completed job
 				completedJob := &jobpool.Job{
 					ID:            "job-completed-multi",
-					Status:        jobpool.JobStatusPending,
+					Status:        jobpool.JobStatusInitialPending,
 					JobType:       "test",
 					JobDefinition: []byte("test"),
 					CreatedAt:     time.Now(),
@@ -180,7 +180,7 @@ var _ = Describe("DeleteJobs", func() {
 				// Create unscheduled job
 				unscheduledJob := &jobpool.Job{
 					ID:            "job-unscheduled-multi",
-					Status:        jobpool.JobStatusPending,
+					Status:        jobpool.JobStatusInitialPending,
 					JobType:       "test",
 					JobDefinition: []byte("test"),
 					CreatedAt:     time.Now(),
@@ -193,7 +193,7 @@ var _ = Describe("DeleteJobs", func() {
 				// Create stopped job
 				stoppedJob := &jobpool.Job{
 					ID:            "job-stopped-multi",
-					Status:        jobpool.JobStatusPending,
+					Status:        jobpool.JobStatusInitialPending,
 					JobType:       "test",
 					JobDefinition: []byte("test"),
 					CreatedAt:     time.Now(),
@@ -221,12 +221,12 @@ var _ = Describe("DeleteJobs", func() {
 	})
 
 	Describe("when deleting jobs not in final states", func() {
-		Context("with PENDING jobs", func() {
+		Context("with INITIAL_PENDING jobs", func() {
 			It("should return an error", func() {
 				// Given: A pending job
 				job := &jobpool.Job{
 					ID:            "job-pending-1",
-					Status:        jobpool.JobStatusPending,
+					Status:        jobpool.JobStatusInitialPending,
 					JobType:       "test",
 					JobDefinition: []byte("test"),
 					CreatedAt:     time.Now(),
@@ -253,7 +253,7 @@ var _ = Describe("DeleteJobs", func() {
 				// Given: A running job
 				job := &jobpool.Job{
 					ID:            "job-running-1",
-					Status:        jobpool.JobStatusPending,
+					Status:        jobpool.JobStatusInitialPending,
 					JobType:       "test",
 					JobDefinition: []byte("test"),
 					CreatedAt:     time.Now(),
@@ -277,12 +277,12 @@ var _ = Describe("DeleteJobs", func() {
 			})
 		})
 
-		Context("with FAILED jobs", func() {
+		Context("with FAILED_RETRY jobs", func() {
 			It("should return an error", func() {
-				// Given: A failed job (which transitions to PENDING)
+				// Given: A failed job (which transitions to INITIAL_PENDING)
 				job := &jobpool.Job{
 					ID:            "job-failed-1",
-					Status:        jobpool.JobStatusPending,
+					Status:        jobpool.JobStatusInitialPending,
 					JobType:       "test",
 					JobDefinition: []byte("test"),
 					CreatedAt:     time.Now(),
@@ -294,11 +294,11 @@ var _ = Describe("DeleteJobs", func() {
 				err = queue.FailJob(ctx, "job-failed-1", "error")
 				Expect(err).NotTo(HaveOccurred())
 
-				// Job is now in PENDING state after FailJob
+				// Job is now in INITIAL_PENDING state after FailJob
 				// When: DeleteJobs is called
 				err = queue.DeleteJobs(ctx, nil, []string{"job-failed-1"})
 
-				// Then: Should return error (PENDING is not a final state)
+				// Then: Should return error (INITIAL_PENDING is not a final state)
 				Expect(err).To(HaveOccurred())
 				Expect(strings.Contains(err.Error(), "not in final states")).To(BeTrue())
 			})
@@ -309,7 +309,7 @@ var _ = Describe("DeleteJobs", func() {
 				// Given: A cancelling job
 				job := &jobpool.Job{
 					ID:            "job-cancelling-1",
-					Status:        jobpool.JobStatusPending,
+					Status:        jobpool.JobStatusInitialPending,
 					JobType:       "test",
 					JobDefinition: []byte("test"),
 					CreatedAt:     time.Now(),
@@ -340,7 +340,7 @@ var _ = Describe("DeleteJobs", func() {
 				// Given: An unknown_retry job
 				job := &jobpool.Job{
 					ID:            "job-unknown-retry-1",
-					Status:        jobpool.JobStatusPending,
+					Status:        jobpool.JobStatusInitialPending,
 					JobType:       "test",
 					JobDefinition: []byte("test"),
 					CreatedAt:     time.Now(),
@@ -371,7 +371,7 @@ var _ = Describe("DeleteJobs", func() {
 				// Given: A completed job and a pending job
 				completedJob := &jobpool.Job{
 					ID:            "job-completed-mixed",
-					Status:        jobpool.JobStatusPending,
+					Status:        jobpool.JobStatusInitialPending,
 					JobType:       "test",
 					JobDefinition: []byte("test"),
 					CreatedAt:     time.Now(),
@@ -385,7 +385,7 @@ var _ = Describe("DeleteJobs", func() {
 
 				pendingJob := &jobpool.Job{
 					ID:            "job-pending-mixed",
-					Status:        jobpool.JobStatusPending,
+					Status:        jobpool.JobStatusInitialPending,
 					JobType:       "test",
 					JobDefinition: []byte("test"),
 					CreatedAt:     time.Now(),
@@ -418,7 +418,7 @@ var _ = Describe("DeleteJobs", func() {
 					jobID := fmt.Sprintf("job-tag-%d", i)
 					job := &jobpool.Job{
 						ID:            jobID,
-						Status:        jobpool.JobStatusPending,
+						Status:        jobpool.JobStatusInitialPending,
 						JobType:       "test",
 						JobDefinition: []byte("test"),
 						Tags:          []string{"project-1"},
@@ -450,7 +450,7 @@ var _ = Describe("DeleteJobs", func() {
 				// Given: Jobs with different tag combinations
 				job1 := &jobpool.Job{
 					ID:            "job-tag-both",
-					Status:        jobpool.JobStatusPending,
+					Status:        jobpool.JobStatusInitialPending,
 					JobType:       "test",
 					JobDefinition: []byte("test"),
 					Tags:          []string{"project-1", "service-1"},
@@ -465,7 +465,7 @@ var _ = Describe("DeleteJobs", func() {
 
 				job2 := &jobpool.Job{
 					ID:            "job-tag-project-only",
-					Status:        jobpool.JobStatusPending,
+					Status:        jobpool.JobStatusInitialPending,
 					JobType:       "test",
 					JobDefinition: []byte("test"),
 					Tags:          []string{"project-1"},
@@ -499,7 +499,7 @@ var _ = Describe("DeleteJobs", func() {
 				for _, jobID := range jobIDs {
 					job := &jobpool.Job{
 						ID:            jobID,
-						Status:        jobpool.JobStatusPending,
+						Status:        jobpool.JobStatusInitialPending,
 						JobType:       "test",
 						JobDefinition: []byte("test"),
 						CreatedAt:     time.Now(),
@@ -529,7 +529,7 @@ var _ = Describe("DeleteJobs", func() {
 				// Given: A completed job
 				job := &jobpool.Job{
 					ID:            "job-exists",
-					Status:        jobpool.JobStatusPending,
+					Status:        jobpool.JobStatusInitialPending,
 					JobType:       "test",
 					JobDefinition: []byte("test"),
 					CreatedAt:     time.Now(),
@@ -559,7 +559,7 @@ var _ = Describe("DeleteJobs", func() {
 				// Job with tag
 				taggedJob := &jobpool.Job{
 					ID:            "job-tagged",
-					Status:        jobpool.JobStatusPending,
+					Status:        jobpool.JobStatusInitialPending,
 					JobType:       "test",
 					JobDefinition: []byte("test"),
 					Tags:          []string{"project-1"},
@@ -575,7 +575,7 @@ var _ = Describe("DeleteJobs", func() {
 				// Job with specific ID (no matching tag)
 				directJob := &jobpool.Job{
 					ID:            "job-direct",
-					Status:        jobpool.JobStatusPending,
+					Status:        jobpool.JobStatusInitialPending,
 					JobType:       "test",
 					JobDefinition: []byte("test"),
 					Tags:          []string{"project-2"},

@@ -30,10 +30,10 @@ var _ = Describe("Atomic Job Lifecycle Methods", func() {
 		Expect(err).NotTo(HaveOccurred())
 		tmpFile.Close()
 
-		backend, err = jobpool.NewSQLiteBackend(tmpFile.Name())
+		backend, err = jobpool.NewSQLiteBackend(tmpFile.Name(), testLogger())
 		Expect(err).NotTo(HaveOccurred())
 
-		queue = jobpool.NewPoolQueue(backend)
+		queue = jobpool.NewPoolQueue(backend, testLogger())
 	})
 
 	AfterEach(func() {
@@ -51,7 +51,7 @@ var _ = Describe("Atomic Job Lifecycle Methods", func() {
 				// Given: A running job
 				job := &jobpool.Job{
 					ID:            "job-running-complete",
-					Status:        jobpool.JobStatusPending,
+					Status:        jobpool.JobStatusInitialPending,
 					JobType:       "test",
 					JobDefinition: []byte("test"),
 					CreatedAt:     time.Now(),
@@ -71,8 +71,9 @@ var _ = Describe("Atomic Job Lifecycle Methods", func() {
 				Expect(err).NotTo(HaveOccurred())
 				Expect(completedJob.Status).To(Equal(jobpool.JobStatusCompleted))
 				Expect(completedJob.Result).To(Equal(result))
-				Expect(completedJob.CompletedAt).NotTo(BeNil())
-				Expect(completedJob.AssigneeID).To(BeEmpty())
+				Expect(completedJob.FinalizedAt).NotTo(BeNil())
+				// AssigneeID is preserved for historical tracking (per spec)
+				Expect(completedJob.AssigneeID).To(Equal("worker-1"))
 			})
 		})
 
@@ -81,7 +82,7 @@ var _ = Describe("Atomic Job Lifecycle Methods", func() {
 				// Given: A job in CANCELLING state
 				job := &jobpool.Job{
 					ID:            "job-cancelling-complete",
-					Status:        jobpool.JobStatusPending,
+					Status:        jobpool.JobStatusInitialPending,
 					JobType:       "test",
 					JobDefinition: []byte("test"),
 					CreatedAt:     time.Now(),
@@ -111,7 +112,7 @@ var _ = Describe("Atomic Job Lifecycle Methods", func() {
 				// Given: A job in UNKNOWN_RETRY state
 				job := &jobpool.Job{
 					ID:            "job-unknown-retry-complete",
-					Status:        jobpool.JobStatusPending,
+					Status:        jobpool.JobStatusInitialPending,
 					JobType:       "test",
 					JobDefinition: []byte("test"),
 					CreatedAt:     time.Now(),
@@ -141,7 +142,7 @@ var _ = Describe("Atomic Job Lifecycle Methods", func() {
 				// Given: A job in UNKNOWN_STOPPED state
 				job := &jobpool.Job{
 					ID:            "job-unknown-stopped-complete",
-					Status:        jobpool.JobStatusPending,
+					Status:        jobpool.JobStatusInitialPending,
 					JobType:       "test",
 					JobDefinition: []byte("test"),
 					CreatedAt:     time.Now(),
@@ -171,10 +172,10 @@ var _ = Describe("Atomic Job Lifecycle Methods", func() {
 
 		Context("when attempting to complete a job from invalid state", func() {
 			It("should return an error", func() {
-				// Given: A job in PENDING state (invalid for completion)
+				// Given: A job in INITIAL_PENDING state (invalid for completion)
 				job := &jobpool.Job{
 					ID:            "job-pending-invalid",
-					Status:        jobpool.JobStatusPending,
+					Status:        jobpool.JobStatusInitialPending,
 					JobType:       "test",
 					JobDefinition: []byte("test"),
 					CreatedAt:     time.Now(),
@@ -194,11 +195,11 @@ var _ = Describe("Atomic Job Lifecycle Methods", func() {
 
 	Describe("FailJob", func() {
 		Context("when failing a job from RUNNING state", func() {
-			It("should transition to FAILED then PENDING with retry increment", func() {
+			It("should transition to FAILED_RETRY with retry increment", func() {
 				// Given: A running job
 				job := &jobpool.Job{
 					ID:            "job-running-fail",
-					Status:        jobpool.JobStatusPending,
+					Status:        jobpool.JobStatusInitialPending,
 					JobType:       "test",
 					JobDefinition: []byte("test"),
 					CreatedAt:     time.Now(),
@@ -213,24 +214,26 @@ var _ = Describe("Atomic Job Lifecycle Methods", func() {
 				errorMsg := "test error"
 				err = queue.FailJob(ctx, "job-running-fail", errorMsg)
 
-				// Then: Job should be in PENDING state with incremented retry count
+				// Then: Job should be in FAILED_RETRY state with incremented retry count
+				// Jobs never return to INITIAL_PENDING once they leave it
 				Expect(err).NotTo(HaveOccurred())
 				failedJob, err := queue.GetJob(ctx, "job-running-fail")
 				Expect(err).NotTo(HaveOccurred())
-				Expect(failedJob.Status).To(Equal(jobpool.JobStatusPending))
+				Expect(failedJob.Status).To(Equal(jobpool.JobStatusFailedRetry))
 				Expect(failedJob.RetryCount).To(Equal(1))
 				Expect(failedJob.ErrorMessage).To(Equal(errorMsg))
 				Expect(failedJob.LastRetryAt).NotTo(BeNil())
-				Expect(failedJob.AssigneeID).To(BeEmpty())
+				// AssigneeID is preserved for historical tracking (per spec)
+				Expect(failedJob.AssigneeID).To(Equal("worker-1"))
 			})
 		})
 
 		Context("when failing a job from UNKNOWN_RETRY state", func() {
-			It("should transition to FAILED then PENDING with retry increment", func() {
+			It("should transition to FAILED_RETRY with retry increment", func() {
 				// Given: A job in UNKNOWN_RETRY state
 				job := &jobpool.Job{
 					ID:            "job-unknown-retry-fail",
-					Status:        jobpool.JobStatusPending,
+					Status:        jobpool.JobStatusInitialPending,
 					JobType:       "test",
 					JobDefinition: []byte("test"),
 					CreatedAt:     time.Now(),
@@ -247,11 +250,12 @@ var _ = Describe("Atomic Job Lifecycle Methods", func() {
 				errorMsg := "error after reconnect"
 				err = queue.FailJob(ctx, "job-unknown-retry-fail", errorMsg)
 
-				// Then: Job should be in PENDING state with incremented retry count
+				// Then: Job should be in FAILED_RETRY state with incremented retry count
+				// Jobs never return to INITIAL_PENDING once they leave it
 				Expect(err).NotTo(HaveOccurred())
 				failedJob, err := queue.GetJob(ctx, "job-unknown-retry-fail")
 				Expect(err).NotTo(HaveOccurred())
-				Expect(failedJob.Status).To(Equal(jobpool.JobStatusPending))
+				Expect(failedJob.Status).To(Equal(jobpool.JobStatusFailedRetry))
 				Expect(failedJob.RetryCount).To(Equal(1))
 				Expect(failedJob.ErrorMessage).To(Equal(errorMsg))
 			})
@@ -259,10 +263,10 @@ var _ = Describe("Atomic Job Lifecycle Methods", func() {
 
 		Context("when attempting to fail a job from invalid state", func() {
 			It("should return an error", func() {
-				// Given: A job in PENDING state (invalid for failure)
+				// Given: A job in INITIAL_PENDING state (invalid for failure)
 				job := &jobpool.Job{
 					ID:            "job-pending-fail-invalid",
-					Status:        jobpool.JobStatusPending,
+					Status:        jobpool.JobStatusInitialPending,
 					JobType:       "test",
 					JobDefinition: []byte("test"),
 					CreatedAt:     time.Now(),
@@ -286,7 +290,7 @@ var _ = Describe("Atomic Job Lifecycle Methods", func() {
 				// Given: A running job
 				job := &jobpool.Job{
 					ID:            "job-running-stop",
-					Status:        jobpool.JobStatusPending,
+					Status:        jobpool.JobStatusInitialPending,
 					JobType:       "test",
 					JobDefinition: []byte("test"),
 					CreatedAt:     time.Now(),
@@ -306,8 +310,9 @@ var _ = Describe("Atomic Job Lifecycle Methods", func() {
 				Expect(err).NotTo(HaveOccurred())
 				Expect(stoppedJob.Status).To(Equal(jobpool.JobStatusStopped))
 				Expect(stoppedJob.ErrorMessage).To(Equal(errorMsg))
-				Expect(stoppedJob.CompletedAt).NotTo(BeNil())
-				Expect(stoppedJob.AssigneeID).To(BeEmpty())
+				Expect(stoppedJob.FinalizedAt).NotTo(BeNil())
+				// AssigneeID is preserved for historical tracking (per spec)
+				Expect(stoppedJob.AssigneeID).To(Equal("worker-1"))
 			})
 		})
 
@@ -316,7 +321,7 @@ var _ = Describe("Atomic Job Lifecycle Methods", func() {
 				// Given: A job in CANCELLING state
 				job := &jobpool.Job{
 					ID:            "job-cancelling-stop",
-					Status:        jobpool.JobStatusPending,
+					Status:        jobpool.JobStatusInitialPending,
 					JobType:       "test",
 					JobDefinition: []byte("test"),
 					CreatedAt:     time.Now(),
@@ -346,7 +351,7 @@ var _ = Describe("Atomic Job Lifecycle Methods", func() {
 				// Given: A job in UNKNOWN_RETRY state
 				job := &jobpool.Job{
 					ID:            "job-unknown-retry-stop",
-					Status:        jobpool.JobStatusPending,
+					Status:        jobpool.JobStatusInitialPending,
 					JobType:       "test",
 					JobDefinition: []byte("test"),
 					CreatedAt:     time.Now(),
@@ -373,10 +378,10 @@ var _ = Describe("Atomic Job Lifecycle Methods", func() {
 
 		Context("when attempting to stop a job from invalid state", func() {
 			It("should return an error", func() {
-				// Given: A job in PENDING state (invalid for stopping)
+				// Given: A job in INITIAL_PENDING state (invalid for stopping)
 				job := &jobpool.Job{
 					ID:            "job-pending-stop-invalid",
-					Status:        jobpool.JobStatusPending,
+					Status:        jobpool.JobStatusInitialPending,
 					JobType:       "test",
 					JobDefinition: []byte("test"),
 					CreatedAt:     time.Now(),
@@ -400,7 +405,7 @@ var _ = Describe("Atomic Job Lifecycle Methods", func() {
 				// Given: A job in CANCELLING state
 				job := &jobpool.Job{
 					ID:            "job-cancelling-stop-retry",
-					Status:        jobpool.JobStatusPending,
+					Status:        jobpool.JobStatusInitialPending,
 					JobType:       "test",
 					JobDefinition: []byte("test"),
 					CreatedAt:     time.Now(),
@@ -413,7 +418,7 @@ var _ = Describe("Atomic Job Lifecycle Methods", func() {
 				_, _, err = queue.CancelJobs(ctx, nil, []string{"job-cancelling-stop-retry"})
 				Expect(err).NotTo(HaveOccurred())
 
-				// When: Job fails while being cancelled (applies FAILED state effects)
+				// When: Job fails while being cancelled (applies FAILED_RETRY state effects)
 				errorMsg := "job failed while being cancelled"
 				err = queue.StopJobWithRetry(ctx, "job-cancelling-stop-retry", errorMsg)
 
@@ -425,7 +430,7 @@ var _ = Describe("Atomic Job Lifecycle Methods", func() {
 				Expect(stoppedJob.ErrorMessage).To(Equal(errorMsg))
 				Expect(stoppedJob.RetryCount).To(Equal(1))
 				Expect(stoppedJob.LastRetryAt).NotTo(BeNil())
-				Expect(stoppedJob.CompletedAt).NotTo(BeNil())
+				Expect(stoppedJob.FinalizedAt).NotTo(BeNil())
 			})
 		})
 
@@ -434,7 +439,7 @@ var _ = Describe("Atomic Job Lifecycle Methods", func() {
 				// Given: A job in RUNNING state (invalid - should use StopJob instead)
 				job := &jobpool.Job{
 					ID:            "job-running-stop-retry-invalid",
-					Status:        jobpool.JobStatusPending,
+					Status:        jobpool.JobStatusInitialPending,
 					JobType:       "test",
 					JobDefinition: []byte("test"),
 					CreatedAt:     time.Now(),
@@ -460,7 +465,7 @@ var _ = Describe("Atomic Job Lifecycle Methods", func() {
 				// Given: A job in CANCELLING state
 				job := &jobpool.Job{
 					ID:            "job-cancelling-unknown-stopped",
-					Status:        jobpool.JobStatusPending,
+					Status:        jobpool.JobStatusInitialPending,
 					JobType:       "test",
 					JobDefinition: []byte("test"),
 					CreatedAt:     time.Now(),
@@ -482,8 +487,9 @@ var _ = Describe("Atomic Job Lifecycle Methods", func() {
 				Expect(err).NotTo(HaveOccurred())
 				Expect(unknownJob.Status).To(Equal(jobpool.JobStatusUnknownStopped))
 				Expect(unknownJob.ErrorMessage).To(Equal(errorMsg))
-				Expect(unknownJob.CompletedAt).NotTo(BeNil())
-				Expect(unknownJob.AssigneeID).To(BeEmpty())
+				Expect(unknownJob.FinalizedAt).NotTo(BeNil())
+				// AssigneeID is preserved for historical tracking (per spec)
+				Expect(unknownJob.AssigneeID).To(Equal("worker-1"))
 			})
 		})
 
@@ -492,7 +498,7 @@ var _ = Describe("Atomic Job Lifecycle Methods", func() {
 				// Given: A job in UNKNOWN_RETRY state
 				job := &jobpool.Job{
 					ID:            "job-unknown-retry-unknown-stopped",
-					Status:        jobpool.JobStatusPending,
+					Status:        jobpool.JobStatusInitialPending,
 					JobType:       "test",
 					JobDefinition: []byte("test"),
 					CreatedAt:     time.Now(),
@@ -522,7 +528,7 @@ var _ = Describe("Atomic Job Lifecycle Methods", func() {
 				// Given: A job in RUNNING state
 				job := &jobpool.Job{
 					ID:            "job-running-unknown-stopped",
-					Status:        jobpool.JobStatusPending,
+					Status:        jobpool.JobStatusInitialPending,
 					JobType:       "test",
 					JobDefinition: []byte("test"),
 					CreatedAt:     time.Now(),
@@ -552,7 +558,7 @@ var _ = Describe("Atomic Job Lifecycle Methods", func() {
 				// Given: A job in UNKNOWN_STOPPED state
 				job := &jobpool.Job{
 					ID:            "job-update-status",
-					Status:        jobpool.JobStatusPending,
+					Status:        jobpool.JobStatusInitialPending,
 					JobType:       "test",
 					JobDefinition: []byte("test"),
 					CreatedAt:     time.Now(),
@@ -569,7 +575,7 @@ var _ = Describe("Atomic Job Lifecycle Methods", func() {
 				// When: Updating to STOPPED (edge case transition)
 				result := []byte("edge case result")
 				errorMsg := "edge case error"
-				err = queue.UpdateJobStatus(ctx, "job-update-status", jobpool.JobStatusStopped, result, errorMsg)
+				_, err = backend.UpdateJobStatus(ctx, "job-update-status", jobpool.JobStatusStopped, result, errorMsg)
 
 				// Then: Job should be in STOPPED state with updated fields
 				Expect(err).NotTo(HaveOccurred())
@@ -586,7 +592,7 @@ var _ = Describe("Atomic Job Lifecycle Methods", func() {
 				// Given: A job in UNKNOWN_STOPPED state
 				job := &jobpool.Job{
 					ID:            "job-update-eligible",
-					Status:        jobpool.JobStatusPending,
+					Status:        jobpool.JobStatusInitialPending,
 					JobType:       "test",
 					JobDefinition: []byte("test"),
 					Tags:          []string{"test-tag"},
@@ -601,14 +607,14 @@ var _ = Describe("Atomic Job Lifecycle Methods", func() {
 				err = queue.MarkJobUnknownStopped(ctx, "job-update-eligible", "timeout")
 				Expect(err).NotTo(HaveOccurred())
 
-				// When: Updating to PENDING (becomes eligible)
-				err = queue.UpdateJobStatus(ctx, "job-update-eligible", jobpool.JobStatusPending, nil, "")
+				// When: Updating to INITIAL_PENDING (becomes eligible)
+				_, err = backend.UpdateJobStatus(ctx, "job-update-eligible", jobpool.JobStatusInitialPending, nil, "")
 
-				// Then: Job should be in PENDING state (workers would be notified)
+				// Then: Job should be in INITIAL_PENDING state (workers would be notified)
 				Expect(err).NotTo(HaveOccurred())
 				updatedJob, err := queue.GetJob(ctx, "job-update-eligible")
 				Expect(err).NotTo(HaveOccurred())
-				Expect(updatedJob.Status).To(Equal(jobpool.JobStatusPending))
+				Expect(updatedJob.Status).To(Equal(jobpool.JobStatusInitialPending))
 			})
 		})
 	})
@@ -629,7 +635,7 @@ var _ = Describe("Atomic Job Lifecycle Methods", func() {
 					// Setup job to target state
 					job := &jobpool.Job{
 						ID:            jobID,
-						Status:        jobpool.JobStatusPending,
+						Status:        jobpool.JobStatusInitialPending,
 						JobType:       "test",
 						JobDefinition: []byte("test"),
 						CreatedAt:     time.Now(),
@@ -685,7 +691,7 @@ var _ = Describe("Atomic Job Lifecycle Methods", func() {
 					// Setup job to target state with unique tag
 					job := &jobpool.Job{
 						ID:            jobID,
-						Status:        jobpool.JobStatusPending,
+						Status:        jobpool.JobStatusInitialPending,
 						JobType:       "test",
 						JobDefinition: []byte("test"),
 						Tags:          []string{tag},
@@ -728,11 +734,12 @@ var _ = Describe("Atomic Job Lifecycle Methods", func() {
 					// When: Using FailJob
 					err = queue.FailJob(ctx, jobID, "error")
 
-					// Then: Should succeed and transition to PENDING
+					// Then: Should succeed and transition to FAILED_RETRY
+					// Jobs never return to INITIAL_PENDING once they leave it
 					Expect(err).NotTo(HaveOccurred())
 					failedJob, err := queue.GetJob(ctx, jobID)
 					Expect(err).NotTo(HaveOccurred())
-					Expect(failedJob.Status).To(Equal(jobpool.JobStatusPending))
+					Expect(failedJob.Status).To(Equal(jobpool.JobStatusFailedRetry))
 					Expect(failedJob.RetryCount).To(Equal(1))
 				}
 			})
@@ -743,7 +750,7 @@ var _ = Describe("Atomic Job Lifecycle Methods", func() {
 				// Given: A job in CANCELLING state
 				job := &jobpool.Job{
 					ID:            "job-cancel-stop",
-					Status:        jobpool.JobStatusPending,
+					Status:        jobpool.JobStatusInitialPending,
 					JobType:       "test",
 					JobDefinition: []byte("test"),
 					CreatedAt:     time.Now(),
@@ -768,11 +775,11 @@ var _ = Describe("Atomic Job Lifecycle Methods", func() {
 		})
 
 		Context("when a job fails while being cancelled", func() {
-			It("should use StopJobWithRetry to apply FAILED state effects", func() {
+			It("should use StopJobWithRetry to apply FAILED_RETRY state effects", func() {
 				// Given: A job in CANCELLING state
 				job := &jobpool.Job{
 					ID:            "job-cancel-fail-stop",
-					Status:        jobpool.JobStatusPending,
+					Status:        jobpool.JobStatusInitialPending,
 					JobType:       "test",
 					JobDefinition: []byte("test"),
 					CreatedAt:     time.Now(),
@@ -804,14 +811,14 @@ var _ = Describe("Atomic Job Lifecycle Methods", func() {
 				// Given: Two jobs in CANCELLING state
 				job1 := &jobpool.Job{
 					ID:            "job-ack-1",
-					Status:        jobpool.JobStatusPending,
+					Status:        jobpool.JobStatusInitialPending,
 					JobType:       "test",
 					JobDefinition: []byte("test"),
 					CreatedAt:     time.Now(),
 				}
 				job2 := &jobpool.Job{
 					ID:            "job-ack-2",
-					Status:        jobpool.JobStatusPending,
+					Status:        jobpool.JobStatusInitialPending,
 					JobType:       "test",
 					JobDefinition: []byte("test"),
 					CreatedAt:     time.Now(),
@@ -849,14 +856,14 @@ var _ = Describe("Atomic Job Lifecycle Methods", func() {
 				// Given: Two jobs in CANCELLING state
 				job1 := &jobpool.Job{
 					ID:            "job-ack-unknown-1",
-					Status:        jobpool.JobStatusPending,
+					Status:        jobpool.JobStatusInitialPending,
 					JobType:       "test",
 					JobDefinition: []byte("test"),
 					CreatedAt:     time.Now(),
 				}
 				job2 := &jobpool.Job{
 					ID:            "job-ack-unknown-2",
-					Status:        jobpool.JobStatusPending,
+					Status:        jobpool.JobStatusInitialPending,
 					JobType:       "test",
 					JobDefinition: []byte("test"),
 					CreatedAt:     time.Now(),
@@ -894,7 +901,7 @@ var _ = Describe("Atomic Job Lifecycle Methods", func() {
 				// Given: A job in CANCELLING state
 				job := &jobpool.Job{
 					ID:            "job-prefer-atomic",
-					Status:        jobpool.JobStatusPending,
+					Status:        jobpool.JobStatusInitialPending,
 					JobType:       "test",
 					JobDefinition: []byte("test"),
 					CreatedAt:     time.Now(),

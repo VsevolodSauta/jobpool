@@ -6,18 +6,22 @@ package main
 import (
 	"context"
 	"fmt"
-	"log"
+	"log/slog"
+	"os"
 	"time"
 
 	"github.com/VsevolodSauta/jobpool"
 )
 
 // newSQLiteBackend is a wrapper that will only compile with sqlite build tag
-func newSQLiteBackend(path string) (jobpool.Backend, error) {
-	return jobpool.NewSQLiteBackend(path)
+func newSQLiteBackend(path string, logger *slog.Logger) (jobpool.Backend, error) {
+	return jobpool.NewSQLiteBackend(path, logger)
 }
 
 func main() {
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
+		Level: slog.LevelInfo,
+	}))
 	// Create backend (SQLite requires CGO, BadgerDB does not)
 	// This example tries SQLite first, falls back to BadgerDB
 	// For builds without CGO, use examples/basic-badger instead
@@ -27,23 +31,24 @@ func main() {
 	// Try SQLite first (requires CGO and sqlite build tag)
 	// This will fail at compile time if built without -tags sqlite
 	// In that case, use examples/basic-badger instead
-	backend, err = newSQLiteBackend("./example.db")
+	backend, err = newSQLiteBackend("./example.db", logger)
 	if err != nil {
 		// Fallback to BadgerDB if SQLite is not available
-		backend, err = jobpool.NewBadgerBackend("./example-data")
+		backend, err = jobpool.NewBadgerBackend("./example-data", logger)
 		if err != nil {
-			log.Fatalf("Failed to create backend: %v", err)
+			logger.Error("Failed to create backend", "error", err)
+			os.Exit(1)
 		}
 	}
 	defer backend.Close()
 
-	queue := jobpool.NewPoolQueue(backend)
+	queue := jobpool.NewPoolQueue(backend, logger)
 	ctx := context.Background()
 
 	// Enqueue a job
 	job := &jobpool.Job{
 		ID:            "job-1",
-		Status:        jobpool.JobStatusPending,
+		Status:        jobpool.JobStatusInitialPending,
 		JobType:       "example_task",
 		JobDefinition: []byte(`{"message": "Hello, World!"}`),
 		Tags:          []string{"example", "demo"},
@@ -53,7 +58,8 @@ func main() {
 
 	jobID, err := queue.EnqueueJob(ctx, job)
 	if err != nil {
-		log.Fatalf("Failed to enqueue job: %v", err)
+		logger.Error("Failed to enqueue job", "error", err)
+		os.Exit(1)
 	}
 
 	fmt.Printf("Enqueued job: %s\n", jobID)
@@ -63,7 +69,7 @@ func main() {
 	go func() {
 		defer close(jobCh)
 		if err := queue.StreamJobs(ctx, "worker-1", nil, 1, jobCh); err != nil {
-			log.Printf("Failed to stream jobs: %v", err)
+			logger.Warn("Failed to stream jobs", "error", err)
 		}
 	}()
 
@@ -76,7 +82,8 @@ func main() {
 			result := []byte(`{"status": "completed"}`)
 			err = queue.CompleteJob(ctx, jobs[0].ID, result)
 			if err != nil {
-				log.Fatalf("Failed to complete job: %v", err)
+				logger.Error("Failed to complete job", "error", err)
+				os.Exit(1)
 			}
 
 			fmt.Printf("Job completed successfully\n")
@@ -86,7 +93,8 @@ func main() {
 	// Get statistics
 	stats, err := queue.GetJobStats(ctx, []string{"example"})
 	if err != nil {
-		log.Fatalf("Failed to get stats: %v", err)
+		logger.Error("Failed to get stats", "error", err)
+		os.Exit(1)
 	}
 
 	fmt.Printf("Statistics: Total=%d, Completed=%d\n", stats.TotalJobs, stats.CompletedJobs)

@@ -18,7 +18,7 @@
 //
 //	job := &jobpool.Job{
 //	    ID:            "job-1",
-//	    Status:        jobpool.JobStatusPending,
+//	    Status:        jobpool.JobStatusInitialPending,
 //	    JobType:       "my_task",
 //	    JobDefinition: []byte(`{"data": "example"}`),
 //	    Tags:          []string{"tag1"},
@@ -35,14 +35,14 @@ import (
 type JobStatus string
 
 const (
-	// JobStatusPending indicates the job is waiting to be processed.
-	JobStatusPending JobStatus = "pending"
+	// JobStatusInitialPending indicates the job is waiting to be processed.
+	JobStatusInitialPending JobStatus = "initial_pending"
 	// JobStatusRunning indicates the job is currently being processed.
 	JobStatusRunning JobStatus = "running"
 	// JobStatusCompleted indicates the job completed successfully.
 	JobStatusCompleted JobStatus = "completed"
-	// JobStatusFailed indicates the job failed during processing.
-	JobStatusFailed JobStatus = "failed"
+	// JobStatusFailedRetry indicates the job failed during processing.
+	JobStatusFailedRetry JobStatus = "failed_retry"
 	// JobStatusStopped indicates the job was running and got cancelled.
 	JobStatusStopped JobStatus = "stopped"
 	// JobStatusUnscheduled indicates the job was pending and got cancelled.
@@ -52,7 +52,7 @@ const (
 	// JobStatusCancelling indicates the job cancellation has been requested (transitional state).
 	// From this state, the job can transition to:
 	// - COMPLETED: JobResultMessage with success=true
-	// - FAILED → STOPPED: JobResultMessage with success=false, then JobCancelledMessage with success=false
+	// - FAILED_RETRY → STOPPED: JobResultMessage with success=false, then JobCancelledMessage with success=false
 	// - STOPPED: JobCancelledMessage with success=true
 	// - UNKNOWN_STOPPED: JobCancelledMessage with success=false or timeout
 	JobStatusCancelling JobStatus = "cancelling"
@@ -69,7 +69,7 @@ type Job struct {
 	Tags          []string   // Tags for filtering and statistics
 	CreatedAt     time.Time  // When the job was created
 	StartedAt     *time.Time // When the job started processing (nil if not started)
-	CompletedAt   *time.Time // When the job completed (nil if not completed)
+	FinalizedAt   *time.Time // When the job completed (nil if not completed)
 	ErrorMessage  string     // Error message if job failed
 	Result        []byte     // Serialized result (if completed)
 	RetryCount    int        // Number of times job has been retried
@@ -86,6 +86,7 @@ type JobStats struct {
 	PendingJobs   int32    // Number of pending jobs
 	RunningJobs   int32    // Number of running jobs
 	CompletedJobs int32    // Number of completed jobs
-	FailedJobs    int32    // Number of failed jobs
+	StoppedJobs   int32    // Number of jobs in final states, except COMPLETED
+	FailedJobs    int32    // Number of failed jobs, including UNKNOWN_RETRY
 	TotalRetries  int32    // Total number of retries across all jobs
 }
