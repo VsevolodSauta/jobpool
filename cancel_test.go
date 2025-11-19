@@ -432,12 +432,15 @@ var _ = Describe("Job Cancellation", func() {
 				Expect(err).NotTo(HaveOccurred())
 				_, err = queue.EnqueueJob(ctx, job3)
 				Expect(err).NotTo(HaveOccurred())
+				worker1 := "worker-1"
+				worker2 := "worker-2"
+				worker3 := "worker-3"
 				// Manually set status to running using backend
-				_, err = backend.DequeueJobs(ctx, "worker-1", nil, 1)
+				_, err = backend.DequeueJobs(ctx, worker1, nil, 1)
 				Expect(err).NotTo(HaveOccurred())
-				_, err = backend.DequeueJobs(ctx, "worker-2", nil, 1)
+				_, err = backend.DequeueJobs(ctx, worker2, nil, 1)
 				Expect(err).NotTo(HaveOccurred())
-				_, err = backend.DequeueJobs(ctx, "worker-3", nil, 1)
+				_, err = backend.DequeueJobs(ctx, worker3, nil, 1)
 				Expect(err).NotTo(HaveOccurred())
 				// Cancel job3 to put it in cancelling state
 				_, _, err = queue.CancelJobs(ctx, nil, []string{"job-restart-3"})
@@ -451,17 +454,17 @@ var _ = Describe("Job Cancellation", func() {
 				job1After, err := queue.GetJob(ctx, "job-restart-1")
 				Expect(err).NotTo(HaveOccurred())
 				Expect(job1After.Status).To(Equal(jobpool.JobStatusUnknownRetry))
-				Expect(job1After.AssigneeID).To(BeEmpty())
+				Expect(job1After.AssigneeID).To(Equal(worker1))
 
 				job2After, err := queue.GetJob(ctx, "job-restart-2")
 				Expect(err).NotTo(HaveOccurred())
 				Expect(job2After.Status).To(Equal(jobpool.JobStatusUnknownRetry))
-				Expect(job2After.AssigneeID).To(BeEmpty())
+				Expect(job2After.AssigneeID).To(Equal(worker2))
 
 				job3After, err := queue.GetJob(ctx, "job-restart-3")
 				Expect(err).NotTo(HaveOccurred())
 				Expect(job3After.Status).To(Equal(jobpool.JobStatusUnknownStopped)) // CANCELLING -> UNKNOWN_STOPPED
-				Expect(job3After.AssigneeID).To(BeEmpty())
+				Expect(job3After.AssigneeID).To(Equal(worker3))
 			})
 		})
 

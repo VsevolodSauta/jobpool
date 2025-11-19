@@ -14,7 +14,7 @@ The Backend is responsible for:
 ### Core Concepts
 
 - **Assignee**: A worker identifier (assigneeID) that can process jobs. The Backend tracks which jobs are assigned to which assignees for capacity management.
-- **Capacity Tracking**: When jobs transition from RUNNING to terminal states (or become eligible again), the Backend returns `freedAssigneeIDs` - a map indicating which assignees had capacity freed and how many jobs were freed. This allows the Queue to manage worker capacity efficiently.
+- **Capacity Tracking**: When jobs transition from RUNNING or CANCELLING to terminal states (or become eligible again), the Backend returns `freedAssigneeIDs` - a map indicating which assignees had capacity freed and how many jobs were freed. This allows the Queue to manage worker capacity efficiently.
 - **Tags**: String labels attached to jobs for filtering. Tag matching uses AND logic: a job matches a filter if the job contains ALL of the specified tags. Empty tags means no filtering (all jobs match).
 - **Job States**: Jobs transition through states (INITIAL_PENDING, RUNNING, COMPLETED, FAILED_RETRY, STOPPED, etc.). Only INITIAL_PENDING, FAILED_RETRY, and UNKNOWN_RETRY states are eligible for scheduling via DequeueJobs.
 - **Eligibility**: Jobs in INITIAL_PENDING, FAILED_RETRY, or UNKNOWN_RETRY states can be assigned to workers. Jobs in other states are not eligible for scheduling.
@@ -33,9 +33,16 @@ Several Backend methods return `map[string]int` called `freedAssigneeIDs`. This 
 
 - **Key**: Assignee ID (worker identifier)
 - **Value**: Count of jobs freed for that assignee
-- **Empty map**: Indicates no capacity was freed (job was not assigned to any assignee)
+- **Empty map**: Indicates no capacity was freed (job was not assigned to any assignee, or job was in a state that doesn't hold capacity)
 - **Typical usage**: Most methods return a map with 0 or 1 entry (one job freed for one assignee)
 - **Multiplicity**: If multiple jobs are freed for the same assignee in a single operation, the count reflects the multiplicity
+
+**Capacity Semantics**:
+- Capacity is held when a job is in `RUNNING` or `CANCELLING` state and assigned to an assignee
+- Capacity is freed when a job transitions from `RUNNING` or `CANCELLING` to a terminal state (COMPLETED, STOPPED, UNKNOWN_STOPPED) or to an eligible state (FAILED_RETRY, UNKNOWN_RETRY)
+- Jobs in `UNKNOWN_RETRY` or `UNKNOWN_STOPPED` states do not hold capacity (they were already freed when they transitioned to these states)
+- Jobs in `INITIAL_PENDING` or `FAILED_RETRY` states do not hold capacity (they are eligible but not assigned)
+- When `AcknowledgeCancellation` is called with `wasExecuting=false`, no capacity is freed because the job was not actively executing
 
 The Queue uses this information to:
 - Free capacity for subscriptions matching the assigneeID
@@ -147,19 +154,20 @@ The following sections specify the behavior of each Backend method using precond
   - All jobs are stored with `INITIAL_PENDING` status
   - All jobs are immediately available for DequeueJobs
 - If unsuccessful:
-  - Returns partial job IDs (for jobs successfully enqueued) and non-nil error
-  - No partial batch creation should occur (atomic operation)
+  - Returns `nil` and non-nil error (atomic operation: all-or-nothing)
+  - No partial job records exist (operation is rolled back on any failure)
 
 **Observable Effects**:
 - All successfully enqueued jobs become available for matching DequeueJobs
 - All jobs appear in stats and queries
 
 **Backend Expectations**:
-- Must create all jobs atomically (all-or-nothing)
+- Must create all jobs atomically (all-or-nothing transaction)
 - Must ensure each job has unique ID (no duplicates within batch or with existing jobs)
 - Should be more efficient than multiple `EnqueueJob` calls
-- Must return error if any job fails validation
+- Must return error if any job fails validation (entire batch is rejected)
 - Must use batch insert operations when possible
+- Must roll back all changes if any job fails (no partial batch creation)
 
 **Error Conditions**:
 - Returns error if any job fails validation (e.g., duplicate ID)
@@ -191,6 +199,8 @@ The following sections specify the behavior of each Backend method using precond
   - `AssigneeID = assigneeID`
   - `AssignedAt` set to current time
   - `StartedAt` set to current time if not already set
+  - `Tags` populated with all tags associated with the job
+  - All other job fields preserved (JobType, JobDefinition, CreatedAt, RetryCount, etc.)
 - Jobs are filtered by tags (AND logic: all provided tags must be in job tags)
 - Empty tags means accept all jobs
 - Jobs are selected in ascending order by `COALESCE(LastRetryAt, CreatedAt)` (oldest first) as a selection criterion
@@ -244,20 +254,20 @@ The following sections specify the behavior of each Backend method using precond
   - `StartedAt` timestamp set to current time if not already set
   - `AssigneeID` and `AssignedAt` are preserved (not cleared) for historical tracking
   - Returns `freedAssigneeIDs` map:
-    - Empty map if job was not assigned to an assignee
-    - Contains `assignee_id` with count=1 if job was assigned
+    - Empty map if job was not assigned to an assignee, or job was in `UNKNOWN_RETRY` or `UNKNOWN_STOPPED` state (these states don't hold capacity)
+    - Contains `assignee_id` with count=1 if job was assigned and in `RUNNING` or `CANCELLING` state (these states hold capacity)
 - If job not found or invalid state:
   - Returns error
 
 **Observable Effects**:
 - Job will never be eligible for scheduling again
-- Capacity is freed for the assignee (if job was assigned)
+- Capacity is freed for the assignee if job was in `RUNNING` or `CANCELLING` state (not freed if job was in `UNKNOWN_RETRY` or `UNKNOWN_STOPPED` state)
 
 **Valid State Transitions**:
-- `RUNNING → COMPLETED`: Normal completion flow
-- `CANCELLING → COMPLETED`: Job completed before cancellation took effect
-- `UNKNOWN_RETRY → COMPLETED`: Job completed after worker reconnection
-- `UNKNOWN_STOPPED → COMPLETED`: Job completed despite previous cancellation issues
+- `RUNNING → COMPLETED`: Normal completion flow (capacity freed)
+- `CANCELLING → COMPLETED`: Job completed before cancellation took effect (capacity freed)
+- `UNKNOWN_RETRY → COMPLETED`: Job completed after worker reconnection (capacity not freed, was already freed)
+- `UNKNOWN_STOPPED → COMPLETED`: Job completed despite previous cancellation issues (capacity not freed, was already freed)
 
 **Backend Expectations**:
 - Must transition job to `COMPLETED` state atomically
@@ -292,18 +302,18 @@ The following sections specify the behavior of each Backend method using precond
   - `LastRetryAt` timestamp set to current time
   - `AssigneeID` and `AssignedAt` are preserved (not cleared) for historical tracking
   - Returns `freedAssigneeIDs` map:
-    - Empty map if job was not assigned to an assignee
-    - Contains `assignee_id` with count=1 if job was assigned
+    - Empty map if job was not assigned to an assignee, or job was in `UNKNOWN_RETRY` state (this state doesn't hold capacity)
+    - Contains `assignee_id` with count=1 if job was assigned and in `RUNNING` state (this state holds capacity)
 - If job not found or invalid state:
   - Returns error
 
 **Observable Effects**:
 - Job becomes eligible for scheduling again (but remains in FAILED_RETRY state)
-- Capacity is freed for the assignee (if job was assigned)
+- Capacity is freed for the assignee if job was in `RUNNING` state (not freed if job was in `UNKNOWN_RETRY` state)
 
 **Valid State Transitions**:
-- `RUNNING → FAILED_RETRY`: Normal failure flow (job eligible for scheduling)
-- `UNKNOWN_RETRY → FAILED_RETRY`: Job failed after worker reconnection (job eligible for scheduling)
+- `RUNNING → FAILED_RETRY`: Normal failure flow (job eligible for scheduling, capacity freed)
+- `UNKNOWN_RETRY → FAILED_RETRY`: Job failed after worker reconnection (job eligible for scheduling, capacity not freed, was already freed)
 
 **Important**: Jobs never return to INITIAL_PENDING state once they leave it. FAILED_RETRY jobs are eligible for scheduling but remain in FAILED_RETRY state.
 
@@ -341,19 +351,19 @@ The following sections specify the behavior of each Backend method using precond
   - `FinalizedAt` timestamp set to current time (if not already set)
   - `AssigneeID` and `AssignedAt` are preserved (not cleared) for historical tracking
   - Returns `freedAssigneeIDs` map:
-    - Empty map if job was not assigned to an assignee
-    - Contains `assignee_id` with count=1 if job was assigned
+    - Empty map if job was not assigned to an assignee, or job was in `UNKNOWN_RETRY` state (this state doesn't hold capacity)
+    - Contains `assignee_id` with count=1 if job was assigned and in `RUNNING` or `CANCELLING` state (these states hold capacity)
 - If job not found or invalid state:
   - Returns error
 
 **Observable Effects**:
 - Job no longer eligible for scheduling (terminal state)
-- Capacity is freed for the assignee (if job was assigned)
+- Capacity is freed for the assignee if job was in `RUNNING` or `CANCELLING` state (not freed if job was in `UNKNOWN_RETRY` state)
 
 **Valid State Transitions**:
-- `RUNNING → STOPPED`: Job cancelled before completion
-- `CANCELLING → STOPPED`: Job cancellation acknowledged by worker (normal cancellation flow)
-- `UNKNOWN_RETRY → STOPPED`: Job cancelled after worker reconnection
+- `RUNNING → STOPPED`: Job cancelled before completion (capacity freed)
+- `CANCELLING → STOPPED`: Job cancellation acknowledged by worker (normal cancellation flow, capacity freed)
+- `UNKNOWN_RETRY → STOPPED`: Job cancelled after worker reconnection (capacity not freed, was already freed)
 
 **Backend Expectations**:
 - Must transition job to `STOPPED` state atomically
@@ -389,13 +399,13 @@ The following sections specify the behavior of each Backend method using precond
   - `AssigneeID` and `AssignedAt` are preserved (not cleared) for historical tracking
   - Returns `freedAssigneeIDs` map:
     - Empty map if job was not assigned to an assignee
-    - Contains `assignee_id` with count=1 if job was assigned
+    - Contains `assignee_id` with count=1 if job was assigned (CANCELLING state holds capacity)
 - If job not found or not in `CANCELLING` state:
   - Returns error
 
 **Observable Effects**:
 - Job no longer eligible for scheduling (terminal state)
-- Capacity is freed for the assignee (if job was assigned)
+- Capacity is freed for the assignee if job was assigned (CANCELLING state holds capacity)
 
 **Valid State Transitions**:
 - `CANCELLING → STOPPED` (with retry increment): Job failed while being cancelled (applies FAILED_RETRY state effects)
@@ -423,22 +433,23 @@ The following sections specify the behavior of each Backend method using precond
 - `ctx` is a valid context
 - `jobID` is non-empty
 - Job exists in storage
+- Job is in a valid state for transition: `RUNNING`, `CANCELLING`, or `UNKNOWN_RETRY`
 
 **Postconditions**:
-- If job exists:
+- If job exists and in valid state:
   - Job status becomes `UNKNOWN_STOPPED`
   - `ErrorMessage` field set
   - `FinalizedAt` timestamp set to current time (if not already set)
   - `AssigneeID` and `AssignedAt` are preserved (not cleared) for historical tracking
   - Returns `freedAssigneeIDs` map:
-    - Empty map if job was not assigned to an assignee
-    - Contains `assignee_id` with count=1 if job was assigned
-- If job not found:
+    - Empty map if job was not assigned to an assignee or was in `UNKNOWN_RETRY` state
+    - Contains `assignee_id` with count=1 if job was assigned and in `RUNNING` or `CANCELLING` state
+- If job not found or invalid state:
   - Returns error
 
 **Observable Effects**:
 - Job no longer eligible for scheduling (terminal state)
-- Capacity is freed for the assignee (if job was assigned)
+- Capacity is freed for the assignee (if job was assigned and in RUNNING or CANCELLING state)
 
 **Valid State Transitions**:
 - `CANCELLING → UNKNOWN_STOPPED`: Cancellation timeout or job unknown to worker
@@ -448,13 +459,15 @@ The following sections specify the behavior of each Backend method using precond
 **Backend Expectations**:
 - Must transition job to `UNKNOWN_STOPPED` state atomically
 - Must store error message and set `FinalizedAt` timestamp
-- Must verify job exists before transition
+- Must verify job exists and is in valid state before transition
 - Must preserve `AssigneeID` and `AssignedAt` for historical tracking
 - Must return error if job doesn't exist
-- Must return `freedAssigneeIDs` based on whether job was assigned
+- Must return error if job is in invalid state (terminal states like `COMPLETED`, `STOPPED`, `UNSCHEDULED`, `UNKNOWN_STOPPED`)
+- Must return `freedAssigneeIDs` based on whether job was assigned and its state (RUNNING/CANCELLING free capacity, UNKNOWN_RETRY does not)
 
 **Error Conditions**:
 - Returns error if job doesn't exist
+- Returns error if job is in invalid state (terminal states like `COMPLETED`, `STOPPED`, `UNSCHEDULED`, `UNKNOWN_STOPPED`)
 - Returns error if database/storage operation fails
 - Returns error if context is cancelled
 
@@ -478,14 +491,14 @@ The following sections specify the behavior of each Backend method using precond
     - `FinalizedAt` set if transitioning to terminal state and not already set
   - `AssigneeID` and `AssignedAt` are preserved (not cleared) for historical tracking
   - Returns `freedAssigneeIDs` map:
-    - Empty map if job was not assigned or not transitioning from RUNNING to terminal state
-    - Contains `assignee_id` with count=1 if job was assigned and transitioning to terminal state (COMPLETED, STOPPED, UNKNOWN_STOPPED)
+    - Empty map if job was not assigned, or job was in a state that doesn't hold capacity (UNKNOWN_RETRY, UNKNOWN_STOPPED), or not transitioning from RUNNING/CANCELLING to terminal state
+    - Contains `assignee_id` with count=1 if job was assigned and in RUNNING or CANCELLING state and transitioning to terminal state (COMPLETED, STOPPED, UNKNOWN_STOPPED)
 - If job not found or invalid transition:
   - Returns error
 
 **Observable Effects**:
 - Job state changes according to transition
-- Capacity may be freed if transitioning from RUNNING to terminal state
+- Capacity may be freed if transitioning from RUNNING or CANCELLING to terminal state (not freed if job was in UNKNOWN_RETRY or UNKNOWN_STOPPED state)
 
 **Backend Expectations**:
 - Must update job status atomically
@@ -565,16 +578,18 @@ The following sections specify the behavior of each Backend method using precond
 - If `wasExecuting = true`:
   - Job status becomes `STOPPED`
   - `FinalizedAt` timestamp set to current time (if not already set)
+  - Capacity is freed for the assignee (if job was assigned)
 - If `wasExecuting = false`:
   - Job status becomes `UNKNOWN_STOPPED`
   - `FinalizedAt` timestamp set to current time (if not already set)
+  - Capacity is not freed (job was not executing, so no capacity was held)
 - `AssigneeID` and `AssignedAt` are preserved (not cleared) for historical tracking
 - If job not found or not in `CANCELLING` state:
   - Returns error
 
 **Observable Effects**:
 - Job transitions to terminal state
-- Capacity is freed for the assignee (if job was assigned and wasExecuting=true)
+- Capacity is freed for the assignee only if `wasExecuting=true` (job was actively executing when cancelled)
 
 **Valid State Transitions**:
 - `CANCELLING → STOPPED` (if `wasExecuting=true`): Cancellation acknowledged by worker
@@ -698,17 +713,21 @@ The following sections specify the behavior of each Backend method using precond
 - `ttl > 0`
 
 **Postconditions**:
-- Deletes `COMPLETED` jobs older than `ttl`
+- Deletes `COMPLETED` jobs where `finalized_at` timestamp is older than `ttl` (current time - ttl)
+- Only jobs with `finalized_at IS NOT NULL` are considered (jobs without finalized_at are never deleted)
 - Returns error if operation fails
 
 **Observable Effects**:
 - Jobs removed from system
 - Statistics updated
+- Associated tags are also deleted (cascade delete)
 
 **Backend Expectations**:
-- Must find `COMPLETED` jobs older than `ttl`
+- Must find `COMPLETED` jobs where `finalized_at <= (current_time - ttl)`
+- Must only consider jobs with `finalized_at IS NOT NULL` (jobs without finalized_at are never deleted)
 - Must delete matching jobs permanently
-- Must support efficient time-based queries
+- Must delete associated tags (cascade delete)
+- Must support efficient time-based queries on `finalized_at` timestamp
 - Should use batch delete operations when possible
 
 **Error Conditions**:
@@ -724,28 +743,31 @@ The following sections specify the behavior of each Backend method using precond
 - `ctx` is a valid context
 
 **Postconditions**:
-- All `RUNNING` jobs transition to `UNKNOWN_RETRY`
+- All `RUNNING` jobs transition to `UNKNOWN_RETRY` (eligible for retry)
+- All `CANCELLING` jobs transition to `UNKNOWN_STOPPED` (terminal state, cancellation was in progress)
 - `AssigneeID` and `AssignedAt` are preserved (not cleared) for all affected jobs
 - Returns error if operation fails
-- If no running jobs exist:
+- If no running or cancelling jobs exist:
   - Operation is no-op (not an error)
 
 **Observable Effects**:
-- Jobs become eligible for scheduling
-- Capacity is freed for workers (jobs are unassigned)
+- RUNNING jobs become eligible for scheduling (transition to UNKNOWN_RETRY)
+- CANCELLING jobs become terminal (transition to UNKNOWN_STOPPED)
+- Capacity is freed for workers (RUNNING jobs are unassigned and become eligible)
 
 **Backend Expectations**:
-- Must find all jobs in `RUNNING` state
-- Must transition all `RUNNING` jobs to `UNKNOWN_RETRY` atomically
+- Must find all jobs in `RUNNING` state and transition them to `UNKNOWN_RETRY`
+- Must find all jobs in `CANCELLING` state and transition them to `UNKNOWN_STOPPED`
+- Must transition all jobs atomically (single transaction)
 - Must preserve `AssigneeID` and `AssignedAt` for all affected jobs (not cleared)
-- Must handle case where no running jobs exist (no-op, not an error)
+- Must handle case where no running or cancelling jobs exist (no-op, not an error)
 - Must support efficient querying by status and batch updates
 - All transitions should be atomic (transaction)
 
 **Error Conditions**:
 - Returns error if database/storage operation fails
 - Returns error if context is cancelled
-- Should not return error if no running jobs exist (no-op is valid)
+- Should not return error if no running or cancelling jobs exist (no-op is valid)
 
 #### DeleteJobs
 
@@ -920,4 +942,6 @@ Backend implementations should be tested for:
 8. **freedAssigneeIDs Accuracy**: Return values correctly reflect capacity freed
 9. **Tag Filtering**: AND logic works correctly, empty tags means no filtering
 10. **Ordering**: Jobs are selected in correct order (oldest first)
+
+
 

@@ -338,6 +338,7 @@ func (q *PoolQueue) tryDequeueForSubscription(ctx context.Context, sub *subscrip
 // cleanupSubscriptionJobs transitions RUNNING jobs assigned to this subscription to FAILED_RETRY.
 func (q *PoolQueue) cleanupSubscriptionJobs(ctx context.Context, sub *subscription) {
 	q.logger.Debug("cleanupSubscriptionJobs", "assigneeID", sub.assigneeID, "subID", sub.id)
+	cleanupCtx := context.WithoutCancel(ctx)
 	sub.mu.Lock()
 	jobIDs := make([]string, 0, len(sub.assignedJobs))
 	for jobID := range sub.assignedJobs {
@@ -356,7 +357,7 @@ func (q *PoolQueue) cleanupSubscriptionJobs(ctx context.Context, sub *subscripti
 	// Check each job and transition if still RUNNING
 	transitionedCount := 0
 	for _, jobID := range jobIDs {
-		job, err := q.backend.GetJob(ctx, jobID)
+		job, err := q.backend.GetJob(cleanupCtx, jobID)
 		if err != nil {
 			q.logger.Debug("cleanupSubscriptionJobs: GetJob error", "jobID", jobID, "error", err)
 			continue
@@ -364,7 +365,7 @@ func (q *PoolQueue) cleanupSubscriptionJobs(ctx context.Context, sub *subscripti
 		if job.Status == JobStatusRunning {
 			// Transition to FAILED_RETRY with termination error message
 			q.logger.Debug("cleanupSubscriptionJobs: transitioning job from RUNNING to FAILED_RETRY", "jobID", jobID)
-			_, err := q.backend.FailJob(ctx, jobID, errorMsg)
+			_, err := q.backend.FailJob(cleanupCtx, jobID, errorMsg)
 			if err != nil {
 				q.logger.Debug("cleanupSubscriptionJobs: FailJob error", "jobID", jobID, "error", err)
 			} else {

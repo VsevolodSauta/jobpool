@@ -298,27 +298,31 @@ var _ = Describe("Queue API Specification", func() {
 				time.Sleep(100 * time.Millisecond)
 
 				// Receive and fail the job
+				var assignedJob *jobpool.Job
 				select {
 				case jobs := <-assignChan:
 					Expect(len(jobs)).To(BeNumerically(">=", 1))
 					found := false
 					for _, j := range jobs {
 						if j.ID == "job-failed-retry-1" {
+							assignedJob = j
 							found = true
 							break
 						}
 					}
 					Expect(found).To(BeTrue(), "Job should be assigned")
+					Expect(assignedJob.Status).To(Equal(jobpool.JobStatusRunning), "Assigned job should be in RUNNING state")
 				case <-time.After(2 * time.Second):
 					Fail("Job should be assigned")
 				}
 
+				// Fail the job BEFORE canceling StreamJobs (transitions to FAILED_RETRY)
+				// Use the job we received from StreamJobs, which should already be in RUNNING state
+				err = queue.FailJob(ctx, assignedJob.ID, "test error")
+				Expect(err).NotTo(HaveOccurred())
+
 				assignCancel()
 				assignWg.Wait()
-
-				// Fail the job (transitions to FAILED_RETRY)
-				err = queue.FailJob(ctx, "job-failed-retry-1", "test error")
-				Expect(err).NotTo(HaveOccurred())
 
 				// Set up StreamJobs worker for retry
 				jobChan := make(chan []*jobpool.Job, 10)
@@ -1408,11 +1412,7 @@ var _ = Describe("Queue API Specification", func() {
 				err = queue.CompleteJob(ctx, "job-recent", []byte("completed"))
 				Expect(err).NotTo(HaveOccurred())
 
-				// Cancel StreamJobs before failing jobs to prevent it from dequeuing them again
-				streamCancel()
-				wg.Wait()
-
-				// Fail job1 and job3 to set last_retry_at
+				// Fail job1 and job3 BEFORE cancelling StreamJobs to set last_retry_at
 				// These jobs are in RUNNING state, so FailJob should transition them to FAILED_RETRY
 				err = queue.FailJob(ctx, "job-early-retry", "error1")
 				Expect(err).NotTo(HaveOccurred())
@@ -1422,6 +1422,10 @@ var _ = Describe("Queue API Specification", func() {
 				Expect(err).NotTo(HaveOccurred())
 				// Additional delay to ensure backend transaction is committed
 				time.Sleep(100 * time.Millisecond)
+
+				// Cancel StreamJobs after failing jobs to prevent it from dequeuing them again
+				streamCancel()
+				wg.Wait()
 
 				// Wait for state transitions to complete and verify failed jobs are in FAILED_RETRY state
 				// Use Eventually to wait for the state transition (backend may need time to commit)
@@ -1995,12 +1999,12 @@ var _ = Describe("Queue API Specification", func() {
 						Fail("Job should be assigned")
 					}
 
-					streamCancel()
-					wg.Wait()
-
-					// Fail the job
+					// Fail the job BEFORE cancelling StreamJobs
 					err = queue.FailJob(ctx, "job-cancel-failed-1", "test error")
 					Expect(err).NotTo(HaveOccurred())
+
+					streamCancel()
+					wg.Wait()
 
 					// Verify job is in FAILED_RETRY
 					failedJob, err := queue.GetJob(ctx, "job-cancel-failed-1")
@@ -2063,12 +2067,12 @@ var _ = Describe("Queue API Specification", func() {
 						Fail("Job should be assigned")
 					}
 
-					streamCancel()
-					wg.Wait()
-
-					// Mark worker as unresponsive
+					// Mark worker as unresponsive BEFORE cancelling StreamJobs
 					err = queue.MarkWorkerUnresponsive(ctx, "worker-unknown-cancel-1")
 					Expect(err).NotTo(HaveOccurred())
+
+					streamCancel()
+					wg.Wait()
 
 					// Verify job is in UNKNOWN_RETRY
 					unknownJob, err := queue.GetJob(ctx, "job-cancel-unknown-1")
@@ -2131,12 +2135,12 @@ var _ = Describe("Queue API Specification", func() {
 						Fail("Job should be assigned")
 					}
 
-					streamCancel()
-					wg.Wait()
-
-					// Cancel the job (first time)
+					// Cancel the job BEFORE cancelling StreamJobs (first time)
 					_, _, err = queue.CancelJobs(ctx, nil, []string{"job-cancel-already-1"})
 					Expect(err).NotTo(HaveOccurred())
+
+					streamCancel()
+					wg.Wait()
 
 					// Verify job is in CANCELLING
 					cancellingJob, err := queue.GetJob(ctx, "job-cancel-already-1")
@@ -2201,12 +2205,12 @@ var _ = Describe("Queue API Specification", func() {
 						Fail("Job should be assigned")
 					}
 
-					streamCancel()
-					wg.Wait()
-
-					// Cancel the job
+					// Cancel the job BEFORE cancelling StreamJobs
 					_, _, err = queue.CancelJobs(ctx, nil, []string{"job-ack-stop-1"})
 					Expect(err).NotTo(HaveOccurred())
+
+					streamCancel()
+					wg.Wait()
 
 					// Verify job is in CANCELLING
 					cancellingJob, err := queue.GetJob(ctx, "job-ack-stop-1")
@@ -2341,12 +2345,12 @@ var _ = Describe("Queue API Specification", func() {
 						Fail("Job should be assigned")
 					}
 
-					streamCancel()
-					wg.Wait()
-
-					// Cancel the job
+					// Cancel the job BEFORE cancelling StreamJobs
 					_, _, err = queue.CancelJobs(ctx, nil, []string{"job-ack-unknown-1"})
 					Expect(err).NotTo(HaveOccurred())
+
+					streamCancel()
+					wg.Wait()
 
 					// Verify job is in CANCELLING
 					cancellingJob, err := queue.GetJob(ctx, "job-ack-unknown-1")
@@ -2414,9 +2418,6 @@ var _ = Describe("Queue API Specification", func() {
 					}
 					Expect(len(receivedJobs)).To(BeNumerically(">=", 2), "At least 2 jobs should be received")
 
-					streamCancel()
-					wg.Wait()
-
 					// Verify jobs are RUNNING
 					for jobID := range receivedJobs {
 						job, err := queue.GetJob(ctx, jobID)
@@ -2425,9 +2426,12 @@ var _ = Describe("Queue API Specification", func() {
 						Expect(job.AssigneeID).To(Equal("worker-unresponsive-1"))
 					}
 
-					// When: Mark worker as unresponsive
+					// When: Mark worker as unresponsive BEFORE cancelling StreamJobs
 					err := queue.MarkWorkerUnresponsive(ctx, "worker-unresponsive-1")
 					Expect(err).NotTo(HaveOccurred())
+
+					streamCancel()
+					wg.Wait()
 
 					// Then: All jobs should be in UNKNOWN_RETRY state
 					for jobID := range receivedJobs {
@@ -2564,10 +2568,7 @@ var _ = Describe("Queue API Specification", func() {
 						Fail("Job should be assigned")
 					}
 
-					streamCancel()
-					wg.Wait()
-
-					// Cancel the job
+					// Cancel the job BEFORE cancelling StreamJobs
 					_, _, err = queue.CancelJobs(ctx, nil, []string{"job-unresponsive-cancelling-1"})
 					Expect(err).NotTo(HaveOccurred())
 
@@ -2576,9 +2577,12 @@ var _ = Describe("Queue API Specification", func() {
 					Expect(err).NotTo(HaveOccurred())
 					Expect(cancellingJob.Status).To(Equal(jobpool.JobStatusCancelling))
 
-					// When: Mark worker as unresponsive
+					// When: Mark worker as unresponsive BEFORE cancelling StreamJobs
 					err = queue.MarkWorkerUnresponsive(ctx, "worker-unresponsive-cancelling-1")
 					Expect(err).NotTo(HaveOccurred())
+
+					streamCancel()
+					wg.Wait()
 
 					// Then: Job should be in UNKNOWN_STOPPED state
 					unknownStoppedJob, err := queue.GetJob(ctx, "job-unresponsive-cancelling-1")
@@ -2722,11 +2726,10 @@ var _ = Describe("Queue API Specification", func() {
 					// Then: Should have correct counts
 					// Note: Both jobs were assigned via StreamJobs, one was completed, one remains running
 					// After StreamJobs is canceled, the running job should be transitioned to FAILED_RETRY
-					// But if context is canceled during cleanup, the job may remain in RUNNING state
 					Expect(stats.TotalJobs).To(BeNumerically(">=", 2))
 					Expect(stats.CompletedJobs).To(BeNumerically(">=", 1))
-					// Either pending (if cleanup worked) or running (if context was canceled during cleanup)
-					Expect(stats.PendingJobs + stats.RunningJobs).To(BeNumerically(">=", 1))
+					// The remaining job should be in FAILED_RETRY (transitioned by StreamJobs cleanup)
+					Expect(stats.FailedJobs).To(BeNumerically(">=", 1))
 				})
 			})
 		})
@@ -2778,9 +2781,6 @@ var _ = Describe("Queue API Specification", func() {
 						}
 					}
 
-					streamCancel()
-					wg.Wait()
-
 					// Verify jobs are RUNNING
 					for jobID := range receivedJobs {
 						job, err := queue.GetJob(ctx, jobID)
@@ -2788,9 +2788,12 @@ var _ = Describe("Queue API Specification", func() {
 						Expect(job.Status).To(Equal(jobpool.JobStatusRunning))
 					}
 
-					// When: Reset running jobs
+					// When: Reset running jobs BEFORE cancelling StreamJobs
 					err := queue.ResetRunningJobs(ctx)
 					Expect(err).NotTo(HaveOccurred())
+
+					streamCancel()
+					wg.Wait()
 
 					// Then: All jobs should be in UNKNOWN_RETRY state
 					for jobID := range receivedJobs {

@@ -769,17 +769,14 @@ var _ = Describe("Queue Interface", func() {
 			})
 
 			It("should transition UNKNOWN_RETRY job to COMPLETED", func() {
-				// Create job in UNKNOWN_RETRY state
 				job := &jobpool.Job{
 					ID:            "job-1",
-					Status:        jobpool.JobStatusUnknownRetry,
 					JobType:       "test",
 					JobDefinition: []byte("test"),
 					Tags:          []string{"tag1"},
 					CreatedAt:     time.Now(),
-					AssigneeID:    "old-worker",
 				}
-				_, err := backend.EnqueueJob(ctx, job)
+				err := seedUnknownRetryJob(ctx, queue, backend, job)
 				Expect(err).NotTo(HaveOccurred())
 
 				// Complete job
@@ -793,17 +790,14 @@ var _ = Describe("Queue Interface", func() {
 			})
 
 			It("should transition UNKNOWN_STOPPED job to COMPLETED", func() {
-				// Create job in UNKNOWN_STOPPED state
 				job := &jobpool.Job{
 					ID:            "job-1",
-					Status:        jobpool.JobStatusUnknownStopped,
 					JobType:       "test",
 					JobDefinition: []byte("test"),
 					Tags:          []string{"tag1"},
 					CreatedAt:     time.Now(),
-					AssigneeID:    "old-worker",
 				}
-				_, err := backend.EnqueueJob(ctx, job)
+				err := seedUnknownStoppedJob(ctx, queue, backend, job)
 				Expect(err).NotTo(HaveOccurred())
 
 				// Complete job
@@ -961,17 +955,14 @@ var _ = Describe("Queue Interface", func() {
 			})
 
 			It("should transition UNKNOWN_RETRY job to FAILED_RETRY", func() {
-				// Create job in UNKNOWN_RETRY state
 				job := &jobpool.Job{
 					ID:            "job-1",
-					Status:        jobpool.JobStatusUnknownRetry,
 					JobType:       "test",
 					JobDefinition: []byte("test"),
 					Tags:          []string{"tag1"},
 					CreatedAt:     time.Now(),
-					AssigneeID:    "old-worker",
 				}
-				_, err := backend.EnqueueJob(ctx, job)
+				err := seedUnknownRetryJob(ctx, queue, backend, job)
 				Expect(err).NotTo(HaveOccurred())
 
 				// Fail job
@@ -1163,17 +1154,14 @@ var _ = Describe("Queue Interface", func() {
 			})
 
 			It("should transition UNKNOWN_RETRY job to STOPPED", func() {
-				// Create job in UNKNOWN_RETRY state
 				job := &jobpool.Job{
 					ID:            "job-1",
-					Status:        jobpool.JobStatusUnknownRetry,
 					JobType:       "test",
 					JobDefinition: []byte("test"),
 					Tags:          []string{"tag1"},
 					CreatedAt:     time.Now(),
-					AssigneeID:    "old-worker",
 				}
-				_, err := backend.EnqueueJob(ctx, job)
+				err := seedUnknownRetryJob(ctx, queue, backend, job)
 				Expect(err).NotTo(HaveOccurred())
 
 				// Stop job
@@ -1420,17 +1408,14 @@ var _ = Describe("Queue Interface", func() {
 			})
 
 			It("should transition UNKNOWN_RETRY job to UNKNOWN_STOPPED", func() {
-				// Create job in UNKNOWN_RETRY state
 				job := &jobpool.Job{
 					ID:            "job-1",
-					Status:        jobpool.JobStatusUnknownRetry,
 					JobType:       "test",
 					JobDefinition: []byte("test"),
 					Tags:          []string{"tag1"},
 					CreatedAt:     time.Now(),
-					AssigneeID:    "old-worker",
 				}
-				_, err := backend.EnqueueJob(ctx, job)
+				err := seedUnknownRetryJob(ctx, queue, backend, job)
 				Expect(err).NotTo(HaveOccurred())
 
 				// Mark as unknown stopped
@@ -1441,6 +1426,59 @@ var _ = Describe("Queue Interface", func() {
 				retrieved, err := queue.GetJob(ctx, "job-1")
 				Expect(err).NotTo(HaveOccurred())
 				Expect(retrieved.Status).To(Equal(jobpool.JobStatusUnknownStopped))
+			})
+
+			It("should free capacity when transitioning RUNNING job to UNKNOWN_STOPPED", func() {
+				// Enqueue 2 jobs
+				for i := 0; i < 2; i++ {
+					job := &jobpool.Job{
+						ID:            fmt.Sprintf("job-%d", i),
+						Status:        jobpool.JobStatusInitialPending,
+						JobType:       "test",
+						JobDefinition: []byte("test"),
+						Tags:          []string{"tag1"},
+						CreatedAt:     time.Now(),
+					}
+					_, err := queue.EnqueueJob(ctx, job)
+					Expect(err).NotTo(HaveOccurred())
+				}
+
+				// Start StreamJobs with capacity 1
+				jobChan := make(chan []*jobpool.Job, 10)
+				streamCtx, streamCancel := context.WithCancel(ctx)
+				defer streamCancel()
+
+				var wg sync.WaitGroup
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					_ = queue.StreamJobs(streamCtx, "worker-1", []string{"tag1"}, 1, jobChan)
+				}()
+
+				// Receive first job
+				var firstJob *jobpool.Job
+				select {
+				case jobs := <-jobChan:
+					Expect(len(jobs)).To(Equal(1))
+					firstJob = jobs[0]
+				case <-time.After(2 * time.Second):
+					Fail("Should receive first job")
+				}
+
+				// Mark RUNNING job as unknown stopped (should free capacity)
+				err := queue.MarkJobUnknownStopped(ctx, firstJob.ID, "worker unresponsive")
+				Expect(err).NotTo(HaveOccurred())
+
+				// Should receive second job (capacity freed)
+				select {
+				case jobs := <-jobChan:
+					Expect(len(jobs)).To(BeNumerically(">=", 1))
+				case <-time.After(2 * time.Second):
+					Fail("Should receive second job after marking as unknown stopped")
+				}
+
+				streamCancel()
+				wg.Wait()
 			})
 
 			It("should transition RUNNING job to UNKNOWN_STOPPED", func() {
@@ -1504,16 +1542,14 @@ var _ = Describe("Queue Interface", func() {
 	Describe("Cancellation", func() {
 		Context("CancelJobs", func() {
 			It("should transition FAILED_RETRY jobs to STOPPED", func() {
-				// Create job in FAILED_RETRY state
 				job := &jobpool.Job{
 					ID:            "job-1",
-					Status:        jobpool.JobStatusFailedRetry,
 					JobType:       "test",
 					JobDefinition: []byte("test"),
 					Tags:          []string{"tag1"},
 					CreatedAt:     time.Now(),
 				}
-				_, err := backend.EnqueueJob(ctx, job)
+				err := seedFailedRetryJob(ctx, queue, backend, job)
 				Expect(err).NotTo(HaveOccurred())
 
 				cancelled, unknown, err := queue.CancelJobs(ctx, nil, []string{"job-1"})
@@ -1528,17 +1564,14 @@ var _ = Describe("Queue Interface", func() {
 			})
 
 			It("should transition UNKNOWN_RETRY jobs to STOPPED", func() {
-				// Create job in UNKNOWN_RETRY state
 				job := &jobpool.Job{
 					ID:            "job-1",
-					Status:        jobpool.JobStatusUnknownRetry,
 					JobType:       "test",
 					JobDefinition: []byte("test"),
 					Tags:          []string{"tag1"},
 					CreatedAt:     time.Now(),
-					AssigneeID:    "old-worker",
 				}
-				_, err := backend.EnqueueJob(ctx, job)
+				err := seedUnknownRetryJob(ctx, queue, backend, job)
 				Expect(err).NotTo(HaveOccurred())
 
 				cancelled, unknown, err := queue.CancelJobs(ctx, nil, []string{"job-1"})
@@ -1846,6 +1879,63 @@ var _ = Describe("Queue Interface", func() {
 				Expect(err).NotTo(HaveOccurred())
 				Expect(retrieved.Status).To(Equal(jobpool.JobStatusUnknownStopped))
 			})
+
+			It("should not free capacity when wasExecuting=false", func() {
+				// Enqueue 2 jobs
+				for i := 0; i < 2; i++ {
+					job := &jobpool.Job{
+						ID:            fmt.Sprintf("job-%d", i),
+						Status:        jobpool.JobStatusInitialPending,
+						JobType:       "test",
+						JobDefinition: []byte("test"),
+						Tags:          []string{"tag1"},
+						CreatedAt:     time.Now(),
+					}
+					_, err := queue.EnqueueJob(ctx, job)
+					Expect(err).NotTo(HaveOccurred())
+				}
+
+				// Start StreamJobs with capacity 1
+				jobChan := make(chan []*jobpool.Job, 10)
+				streamCtx, streamCancel := context.WithCancel(ctx)
+				defer streamCancel()
+
+				var wg sync.WaitGroup
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					_ = queue.StreamJobs(streamCtx, "worker-1", []string{"tag1"}, 1, jobChan)
+				}()
+
+				// Receive first job
+				var firstJob *jobpool.Job
+				select {
+				case jobs := <-jobChan:
+					Expect(len(jobs)).To(Equal(1))
+					firstJob = jobs[0]
+				case <-time.After(2 * time.Second):
+					Fail("Should receive first job")
+				}
+
+				// Cancel and acknowledge with wasExecuting=false (job was not executing, so no capacity held)
+				_, _, err := queue.CancelJobs(ctx, nil, []string{firstJob.ID})
+				Expect(err).NotTo(HaveOccurred())
+				err = queue.AcknowledgeCancellation(ctx, firstJob.ID, false)
+				Expect(err).NotTo(HaveOccurred())
+
+				// Should NOT receive second job (capacity was not freed because job was not executing)
+				// Wait a bit to ensure no job is received
+				select {
+				case jobs := <-jobChan:
+					// If we receive jobs, it means capacity was incorrectly freed
+					Fail(fmt.Sprintf("Should not receive second job (capacity not freed), but received: %v", jobs))
+				case <-time.After(500 * time.Millisecond):
+					// Expected: no job received because capacity was not freed
+				}
+
+				streamCancel()
+				wg.Wait()
+			})
 		})
 	})
 
@@ -2027,7 +2117,6 @@ var _ = Describe("Queue Interface", func() {
 
 		Context("GetJobStats", func() {
 			It("should return StoppedJobs count", func() {
-				// Create jobs in different states
 				job1 := &jobpool.Job{
 					ID:            "job-1",
 					Status:        jobpool.JobStatusInitialPending,
@@ -2038,7 +2127,7 @@ var _ = Describe("Queue Interface", func() {
 				}
 				job2 := &jobpool.Job{
 					ID:            "job-2",
-					Status:        jobpool.JobStatusStopped,
+					Status:        jobpool.JobStatusInitialPending,
 					JobType:       "test",
 					JobDefinition: []byte("test"),
 					Tags:          []string{"tag1"},
@@ -2046,7 +2135,16 @@ var _ = Describe("Queue Interface", func() {
 				}
 				_, err := queue.EnqueueJob(ctx, job1)
 				Expect(err).NotTo(HaveOccurred())
-				_, err = backend.EnqueueJob(ctx, job2)
+				_, err = queue.EnqueueJob(ctx, job2)
+				Expect(err).NotTo(HaveOccurred())
+
+				// Dequeue one job (could be job1 or job2, doesn't matter)
+				dequeued, err := backend.DequeueJobs(ctx, "state-worker", []string{"tag1"}, 1)
+				Expect(err).NotTo(HaveOccurred())
+				Expect(len(dequeued)).To(Equal(1))
+
+				// Stop the dequeued job
+				err = queue.StopJob(ctx, dequeued[0].ID, "test stop")
 				Expect(err).NotTo(HaveOccurred())
 
 				stats, err := queue.GetJobStats(ctx, []string{"tag1"})
@@ -2055,17 +2153,14 @@ var _ = Describe("Queue Interface", func() {
 			})
 
 			It("should return TotalRetries count", func() {
-				// Create job with retries
 				job := &jobpool.Job{
 					ID:            "job-1",
-					Status:        jobpool.JobStatusFailedRetry,
 					JobType:       "test",
 					JobDefinition: []byte("test"),
 					Tags:          []string{"tag1"},
 					CreatedAt:     time.Now(),
-					RetryCount:    3,
 				}
-				_, err := backend.EnqueueJob(ctx, job)
+				err := seedJobWithRetries(ctx, queue, backend, job, 3)
 				Expect(err).NotTo(HaveOccurred())
 
 				stats, err := queue.GetJobStats(ctx, []string{"tag1"})
@@ -2236,6 +2331,40 @@ var _ = Describe("Queue Interface", func() {
 					Expect(err).NotTo(HaveOccurred())
 					Expect(retrieved.Status).To(Equal(jobpool.JobStatusUnknownRetry))
 				}
+			})
+
+			It("should transition all CANCELLING jobs to UNKNOWN_STOPPED", func() {
+				// Enqueue and assign job
+				job := &jobpool.Job{
+					ID:            "job-1",
+					Status:        jobpool.JobStatusInitialPending,
+					JobType:       "test",
+					JobDefinition: []byte("test"),
+					Tags:          []string{"tag1"},
+					CreatedAt:     time.Now(),
+				}
+				_, err := queue.EnqueueJob(ctx, job)
+				Expect(err).NotTo(HaveOccurred())
+
+				// Assign and cancel job
+				_, err = backend.DequeueJobs(ctx, "worker-1", []string{"tag1"}, 1)
+				Expect(err).NotTo(HaveOccurred())
+				_, _, err = queue.CancelJobs(ctx, nil, []string{"job-1"})
+				Expect(err).NotTo(HaveOccurred())
+
+				// Verify job is in CANCELLING state
+				retrieved, err := queue.GetJob(ctx, "job-1")
+				Expect(err).NotTo(HaveOccurred())
+				Expect(retrieved.Status).To(Equal(jobpool.JobStatusCancelling))
+
+				// Reset running jobs (should handle CANCELLING jobs)
+				err = queue.ResetRunningJobs(ctx)
+				Expect(err).NotTo(HaveOccurred())
+
+				// Verify job is UNKNOWN_STOPPED (CANCELLING → UNKNOWN_STOPPED)
+				retrieved, err = queue.GetJob(ctx, "job-1")
+				Expect(err).NotTo(HaveOccurred())
+				Expect(retrieved.Status).To(Equal(jobpool.JobStatusUnknownStopped))
 			})
 		})
 
@@ -2497,3 +2626,75 @@ var _ = Describe("Queue Interface", func() {
 		})
 	})
 })
+
+func enqueueInitialJob(ctx context.Context, q jobpool.Queue, job *jobpool.Job) error {
+	job.Status = jobpool.JobStatusInitialPending
+	_, err := q.EnqueueJob(ctx, job)
+	return err
+}
+
+func assignJobToWorker(ctx context.Context, backend jobpool.Backend, worker string, tags []string) error {
+	_, err := backend.DequeueJobs(ctx, worker, tags, 1)
+	return err
+}
+
+func seedUnknownRetryJob(ctx context.Context, q jobpool.Queue, backend jobpool.Backend, job *jobpool.Job) error {
+	if err := enqueueInitialJob(ctx, q, job); err != nil {
+		return err
+	}
+	if err := assignJobToWorker(ctx, backend, "state-worker", job.Tags); err != nil {
+		return err
+	}
+	return backend.ResetRunningJobs(ctx)
+}
+
+func seedUnknownStoppedJob(ctx context.Context, q jobpool.Queue, backend jobpool.Backend, job *jobpool.Job) error {
+	if err := enqueueInitialJob(ctx, q, job); err != nil {
+		return err
+	}
+	if err := assignJobToWorker(ctx, backend, "state-worker", job.Tags); err != nil {
+		return err
+	}
+	if _, _, err := q.CancelJobs(ctx, nil, []string{job.ID}); err != nil {
+		return err
+	}
+	return backend.MarkWorkerUnresponsive(ctx, "state-worker")
+}
+
+func seedFailedRetryJob(ctx context.Context, q jobpool.Queue, backend jobpool.Backend, job *jobpool.Job) error {
+	if err := enqueueInitialJob(ctx, q, job); err != nil {
+		return err
+	}
+	if err := assignJobToWorker(ctx, backend, "state-worker", job.Tags); err != nil {
+		return err
+	}
+	_, err := backend.FailJob(ctx, job.ID, "test failure")
+	return err
+}
+
+func seedStoppedJob(ctx context.Context, q jobpool.Queue, backend jobpool.Backend, job *jobpool.Job) error {
+	if err := enqueueInitialJob(ctx, q, job); err != nil {
+		return err
+	}
+	// Dequeue with nil tags to match any job
+	if err := assignJobToWorker(ctx, backend, "state-worker", nil); err != nil {
+		return err
+	}
+	_, err := backend.StopJob(ctx, job.ID, "test stop")
+	return err
+}
+
+func seedJobWithRetries(ctx context.Context, q jobpool.Queue, backend jobpool.Backend, job *jobpool.Job, retries int) error {
+	if err := enqueueInitialJob(ctx, q, job); err != nil {
+		return err
+	}
+	for i := 0; i < retries; i++ {
+		if err := assignJobToWorker(ctx, backend, "retry-worker", job.Tags); err != nil {
+			return err
+		}
+		if _, err := backend.FailJob(ctx, job.ID, fmt.Sprintf("retry-%d", i)); err != nil {
+			return err
+		}
+	}
+	return nil
+}

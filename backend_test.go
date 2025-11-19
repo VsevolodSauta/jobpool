@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/VsevolodSauta/jobpool"
@@ -425,6 +427,7 @@ func BackendTestSuite(backendFactory func() (jobpool.Backend, func())) {
 			Expect(jobs[0].Status).To(Equal(jobpool.JobStatusRunning))
 			Expect(jobs[0].AssigneeID).To(Equal("assignee-1"))
 			Expect(jobs[0].AssignedAt).NotTo(BeNil())
+			Expect(jobs[0].Tags).To(BeEmpty()) // Job had no tags
 		})
 
 		It("should filter by tags", func() {
@@ -454,6 +457,7 @@ func BackendTestSuite(backendFactory func() (jobpool.Backend, func())) {
 			Expect(err).NotTo(HaveOccurred())
 			Expect(jobs).To(HaveLen(1))
 			Expect(jobs[0].ID).To(Equal("job-1"))
+			Expect(jobs[0].Tags).To(ContainElement("tag1")) // Tags should be populated in returned jobs
 		})
 
 		It("should respect limit", func() {
@@ -1326,6 +1330,30 @@ func BackendTestSuite(backendFactory func() (jobpool.Backend, func())) {
 			Expect(err).NotTo(HaveOccurred())
 		})
 
+		It("should make freed jobs available for new workers", func() {
+			for i := 0; i < 2; i++ {
+				job := &jobpool.Job{
+					ID:            fmt.Sprintf("job-worker-free-%d", i),
+					Status:        jobpool.JobStatusInitialPending,
+					JobType:       "test",
+					JobDefinition: []byte("data"),
+					CreatedAt:     time.Now(),
+				}
+				_, err := backend.EnqueueJob(ctx, job)
+				Expect(err).NotTo(HaveOccurred())
+			}
+
+			_, err := backend.DequeueJobs(ctx, "worker-old", nil, 2)
+			Expect(err).NotTo(HaveOccurred())
+
+			err = backend.MarkWorkerUnresponsive(ctx, "worker-old")
+			Expect(err).NotTo(HaveOccurred())
+
+			requeued, err := backend.DequeueJobs(ctx, "worker-new", nil, 2)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(requeued).To(HaveLen(2))
+		})
+
 		It("should propagate context cancellation", func() {
 			cancelCtx, cancel := context.WithCancel(ctx)
 			cancel()
@@ -1369,6 +1397,30 @@ func BackendTestSuite(backendFactory func() (jobpool.Backend, func())) {
 			Expect(err).NotTo(HaveOccurred())
 		})
 
+		It("should allow other workers to claim reset jobs", func() {
+			for i := 0; i < 2; i++ {
+				job := &jobpool.Job{
+					ID:            fmt.Sprintf("job-reset-claim-%d", i),
+					Status:        jobpool.JobStatusInitialPending,
+					JobType:       "test",
+					JobDefinition: []byte("data"),
+					CreatedAt:     time.Now(),
+				}
+				_, err := backend.EnqueueJob(ctx, job)
+				Expect(err).NotTo(HaveOccurred())
+			}
+
+			_, err := backend.DequeueJobs(ctx, "worker-reset-old", nil, 2)
+			Expect(err).NotTo(HaveOccurred())
+
+			err = backend.ResetRunningJobs(ctx)
+			Expect(err).NotTo(HaveOccurred())
+
+			requeued, err := backend.DequeueJobs(ctx, "worker-reset-new", nil, 2)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(requeued).To(HaveLen(2))
+		})
+
 		It("should honor context cancellation", func() {
 			cancelCtx, cancel := context.WithCancel(ctx)
 			cancel()
@@ -1376,6 +1428,40 @@ func BackendTestSuite(backendFactory func() (jobpool.Backend, func())) {
 			err := backend.ResetRunningJobs(cancelCtx)
 			Expect(err).To(HaveOccurred())
 			Expect(err).To(Equal(context.Canceled))
+		})
+
+		It("should transition CANCELLING jobs to UNKNOWN_STOPPED", func() {
+			// Enqueue and assign job
+			job := &jobpool.Job{
+				ID:            "job-cancelling-reset",
+				Status:        jobpool.JobStatusInitialPending,
+				JobType:       "test",
+				JobDefinition: []byte("data"),
+				CreatedAt:     time.Now(),
+			}
+			_, err := backend.EnqueueJob(ctx, job)
+			Expect(err).NotTo(HaveOccurred())
+
+			// Assign and cancel job
+			_, err = backend.DequeueJobs(ctx, "reset-worker", nil, 1)
+			Expect(err).NotTo(HaveOccurred())
+			_, _, err = backend.CancelJobs(ctx, nil, []string{"job-cancelling-reset"})
+			Expect(err).NotTo(HaveOccurred())
+
+			// Verify job is in CANCELLING state
+			retrieved, err := backend.GetJob(ctx, "job-cancelling-reset")
+			Expect(err).NotTo(HaveOccurred())
+			Expect(retrieved.Status).To(Equal(jobpool.JobStatusCancelling))
+
+			// Reset running jobs (should handle CANCELLING jobs)
+			err = backend.ResetRunningJobs(ctx)
+			Expect(err).NotTo(HaveOccurred())
+
+			// Verify job is UNKNOWN_STOPPED (CANCELLING → UNKNOWN_STOPPED)
+			retrieved, err = backend.GetJob(ctx, "job-cancelling-reset")
+			Expect(err).NotTo(HaveOccurred())
+			Expect(retrieved.Status).To(Equal(jobpool.JobStatusUnknownStopped))
+			Expect(retrieved.AssigneeID).To(Equal("reset-worker"))
 		})
 	})
 
@@ -1403,13 +1489,24 @@ func BackendTestSuite(backendFactory func() (jobpool.Backend, func())) {
 
 			_, err = backend.DequeueJobs(ctx, "cleanup-worker", nil, 2)
 			Expect(err).NotTo(HaveOccurred())
+			// Complete old job first
 			_, err = backend.CompleteJob(ctx, "job-cleanup-old", []byte("done"))
 			Expect(err).NotTo(HaveOccurred())
-			time.Sleep(5 * time.Millisecond)
+
+			// Wait to ensure timestamps differ (now using nanosecond precision)
+			// Use 100ms to ensure clear separation
+			time.Sleep(100 * time.Millisecond)
+
+			// Complete new job (its finalized_at will be ~100ms after old job's)
 			_, err = backend.CompleteJob(ctx, "job-cleanup-new", []byte("done"))
 			Expect(err).NotTo(HaveOccurred())
 
-			err = backend.CleanupExpiredJobs(ctx, 1*time.Millisecond)
+			// Wait a bit to ensure finalized_at is set for new job
+			time.Sleep(50 * time.Millisecond)
+
+			// TTL should be between old job's age (100ms+) and new job's age (50ms+)
+			// Use 75ms TTL: old job (100ms+) will be deleted, new job (50ms+) will be kept
+			err = backend.CleanupExpiredJobs(ctx, 75*time.Millisecond)
 			Expect(err).NotTo(HaveOccurred())
 
 			_, err = backend.GetJob(ctx, "job-cleanup-old")
@@ -1422,6 +1519,54 @@ func BackendTestSuite(backendFactory func() (jobpool.Backend, func())) {
 
 		It("should error when ttl <= 0", func() {
 			err := backend.CleanupExpiredJobs(ctx, 0)
+			Expect(err).To(HaveOccurred())
+		})
+
+		It("should only delete jobs with finalized_at set", func() {
+			// Create a job that never gets finalized (stays in RUNNING)
+			jobRunning := &jobpool.Job{
+				ID:            "job-running-no-finalize",
+				Status:        jobpool.JobStatusInitialPending,
+				JobType:       "test",
+				JobDefinition: []byte("data"),
+				CreatedAt:     time.Now().Add(-2 * time.Hour), // Old job
+			}
+			_, err := backend.EnqueueJob(ctx, jobRunning)
+			Expect(err).NotTo(HaveOccurred())
+
+			// Dequeue but don't complete (no finalized_at)
+			_, err = backend.DequeueJobs(ctx, "cleanup-worker", nil, 1)
+			Expect(err).NotTo(HaveOccurred())
+
+			// Create a completed job (has finalized_at)
+			jobCompleted := &jobpool.Job{
+				ID:            "job-completed-finalize",
+				Status:        jobpool.JobStatusInitialPending,
+				JobType:       "test",
+				JobDefinition: []byte("data"),
+				CreatedAt:     time.Now().Add(-2 * time.Hour), // Old job
+			}
+			_, err = backend.EnqueueJob(ctx, jobCompleted)
+			Expect(err).NotTo(HaveOccurred())
+
+			_, err = backend.DequeueJobs(ctx, "cleanup-worker", nil, 1)
+			Expect(err).NotTo(HaveOccurred())
+			_, err = backend.CompleteJob(ctx, "job-completed-finalize", []byte("done"))
+			Expect(err).NotTo(HaveOccurred())
+
+			// Wait to ensure finalized_at is set
+			time.Sleep(10 * time.Millisecond)
+
+			// Cleanup with very short TTL (should delete completed job)
+			err = backend.CleanupExpiredJobs(ctx, 1*time.Millisecond)
+			Expect(err).NotTo(HaveOccurred())
+
+			// Running job should still exist (no finalized_at)
+			_, err = backend.GetJob(ctx, "job-running-no-finalize")
+			Expect(err).NotTo(HaveOccurred())
+
+			// Completed job should be deleted (had finalized_at)
+			_, err = backend.GetJob(ctx, "job-completed-finalize")
 			Expect(err).To(HaveOccurred())
 		})
 
@@ -1483,6 +1628,80 @@ func BackendTestSuite(backendFactory func() (jobpool.Backend, func())) {
 			Expect(err).To(HaveOccurred())
 		})
 
+		It("should delete jobs using both tags and IDs", func() {
+			jobByTag := &jobpool.Job{
+				ID:            "job-delete-union-tag",
+				Status:        jobpool.JobStatusInitialPending,
+				JobType:       "test",
+				JobDefinition: []byte("data"),
+				Tags:          []string{"delete-union"},
+				CreatedAt:     time.Now(),
+			}
+			jobByID := &jobpool.Job{
+				ID:            "job-delete-union-id",
+				Status:        jobpool.JobStatusInitialPending,
+				JobType:       "test",
+				JobDefinition: []byte("data"),
+				CreatedAt:     time.Now(),
+			}
+
+			_, err := backend.EnqueueJob(ctx, jobByTag)
+			Expect(err).NotTo(HaveOccurred())
+			_, err = backend.EnqueueJob(ctx, jobByID)
+			Expect(err).NotTo(HaveOccurred())
+
+			_, err = backend.DequeueJobs(ctx, "delete-union-worker", nil, 2)
+			Expect(err).NotTo(HaveOccurred())
+			_, err = backend.CompleteJob(ctx, "job-delete-union-tag", []byte("done"))
+			Expect(err).NotTo(HaveOccurred())
+			_, err = backend.CompleteJob(ctx, "job-delete-union-id", []byte("done"))
+			Expect(err).NotTo(HaveOccurred())
+
+			err = backend.DeleteJobs(ctx, []string{"delete-union"}, []string{"job-delete-union-id"})
+			Expect(err).NotTo(HaveOccurred())
+
+			_, err = backend.GetJob(ctx, "job-delete-union-tag")
+			Expect(err).To(HaveOccurred())
+			_, err = backend.GetJob(ctx, "job-delete-union-id")
+			Expect(err).To(HaveOccurred())
+		})
+
+		It("should be atomic when any referenced job is not in a final state", func() {
+			jobFinal := &jobpool.Job{
+				ID:            "job-delete-final",
+				Status:        jobpool.JobStatusInitialPending,
+				JobType:       "test",
+				JobDefinition: []byte("data"),
+				Tags:          []string{"delete-mixed"},
+				CreatedAt:     time.Now(),
+			}
+			jobPending := &jobpool.Job{
+				ID:            "job-delete-pending",
+				Status:        jobpool.JobStatusInitialPending,
+				JobType:       "test",
+				JobDefinition: []byte("data"),
+				CreatedAt:     time.Now(),
+			}
+
+			_, err := backend.EnqueueJob(ctx, jobFinal)
+			Expect(err).NotTo(HaveOccurred())
+			_, err = backend.EnqueueJob(ctx, jobPending)
+			Expect(err).NotTo(HaveOccurred())
+
+			_, err = backend.DequeueJobs(ctx, "delete-mixed-worker", nil, 2)
+			Expect(err).NotTo(HaveOccurred())
+			_, err = backend.CompleteJob(ctx, "job-delete-final", []byte("done"))
+			Expect(err).NotTo(HaveOccurred())
+
+			err = backend.DeleteJobs(ctx, []string{"delete-mixed"}, []string{"job-delete-pending"})
+			Expect(err).To(HaveOccurred())
+
+			_, err = backend.GetJob(ctx, "job-delete-final")
+			Expect(err).NotTo(HaveOccurred())
+			_, err = backend.GetJob(ctx, "job-delete-pending")
+			Expect(err).NotTo(HaveOccurred())
+		})
+
 		It("should fail if any job is not in final state", func() {
 			job := &jobpool.Job{
 				ID:            "job-delete-invalid",
@@ -1526,6 +1745,65 @@ func BackendTestSuite(backendFactory func() (jobpool.Backend, func())) {
 			Expect(newBackend.Close()).To(Succeed())
 			// Closing twice should also be safe
 			Expect(newBackend.Close()).To(Succeed())
+
+			_, err := newBackend.EnqueueJob(ctx, &jobpool.Job{
+				ID:            "job-after-close",
+				Status:        jobpool.JobStatusInitialPending,
+				JobType:       "test",
+				JobDefinition: []byte("data"),
+				CreatedAt:     time.Now(),
+			})
+			Expect(err).To(HaveOccurred())
+		})
+	})
+
+	Describe("Concurrency safeguards", func() {
+		It("should assign each job only once across concurrent workers", func() {
+			const jobCount = 20
+			for i := 0; i < jobCount; i++ {
+				job := &jobpool.Job{
+					ID:            fmt.Sprintf("job-concurrency-%d", i),
+					Status:        jobpool.JobStatusInitialPending,
+					JobType:       "test",
+					JobDefinition: []byte("data"),
+					CreatedAt:     time.Now(),
+				}
+				_, err := backend.EnqueueJob(ctx, job)
+				Expect(err).NotTo(HaveOccurred())
+			}
+
+			var processed int32
+			var wg sync.WaitGroup
+			workerCount := 5
+			wg.Add(workerCount)
+
+			for w := 0; w < workerCount; w++ {
+				workerID := fmt.Sprintf("concurrent-worker-%d", w)
+				go func(id string) {
+					defer GinkgoRecover()
+					defer wg.Done()
+					for {
+						if atomic.LoadInt32(&processed) >= jobCount {
+							return
+						}
+
+						jobs, err := backend.DequeueJobs(ctx, id, nil, 1)
+						Expect(err).NotTo(HaveOccurred())
+
+						if len(jobs) == 0 {
+							time.Sleep(2 * time.Millisecond)
+							continue
+						}
+
+						_, err = backend.CompleteJob(ctx, jobs[0].ID, []byte("done"))
+						Expect(err).NotTo(HaveOccurred())
+						atomic.AddInt32(&processed, 1)
+					}
+				}(workerID)
+			}
+
+			wg.Wait()
+			Expect(processed).To(Equal(int32(jobCount)))
 		})
 	})
 
@@ -1714,6 +1992,42 @@ func BackendTestSuite(backendFactory func() (jobpool.Backend, func())) {
 			Expect(err).NotTo(HaveOccurred())
 			Expect(cancelled).To(BeEmpty())
 			Expect(unknown).To(ContainElement("missing"))
+		})
+
+		It("should cancel jobs using union of tags and job IDs", func() {
+			jobByTag := &jobpool.Job{
+				ID:            "job-cancel-union-tag",
+				Status:        jobpool.JobStatusInitialPending,
+				JobType:       "test",
+				JobDefinition: []byte("data"),
+				Tags:          []string{"union"},
+				CreatedAt:     time.Now(),
+			}
+			jobByID := &jobpool.Job{
+				ID:            "job-cancel-union-id",
+				Status:        jobpool.JobStatusInitialPending,
+				JobType:       "test",
+				JobDefinition: []byte("data"),
+				CreatedAt:     time.Now(),
+			}
+
+			_, err := backend.EnqueueJob(ctx, jobByTag)
+			Expect(err).NotTo(HaveOccurred())
+			_, err = backend.EnqueueJob(ctx, jobByID)
+			Expect(err).NotTo(HaveOccurred())
+
+			cancelled, unknown, err := backend.CancelJobs(ctx, []string{"union"}, []string{"job-cancel-union-id"})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(cancelled).To(ContainElements("job-cancel-union-tag", "job-cancel-union-id"))
+			Expect(unknown).To(BeEmpty())
+
+			stateTag, err := backend.GetJob(ctx, "job-cancel-union-tag")
+			Expect(err).NotTo(HaveOccurred())
+			Expect(stateTag.Status).To(Equal(jobpool.JobStatusUnscheduled))
+
+			stateID, err := backend.GetJob(ctx, "job-cancel-union-id")
+			Expect(err).NotTo(HaveOccurred())
+			Expect(stateID.Status).To(Equal(jobpool.JobStatusUnscheduled))
 		})
 
 		It("should return error if no tags or job IDs provided", func() {
@@ -1919,22 +2233,46 @@ func BackendTestSuite(backendFactory func() (jobpool.Backend, func())) {
 				Expect(err).NotTo(HaveOccurred())
 			}
 
-			_, err := backend.DequeueJobs(ctx, "stats-worker", nil, 5)
+			// Dequeue 4 jobs, leaving 1 pending
+			dequeuedJobs, err := backend.DequeueJobs(ctx, "stats-worker", nil, 4)
 			Expect(err).NotTo(HaveOccurred())
+			Expect(len(dequeuedJobs)).To(Equal(4)) // Exactly 4 jobs should be dequeued
 
-			// keep one job running
-			_, err = backend.CompleteJob(ctx, "job-stats-completed", []byte("done"))
-			Expect(err).NotTo(HaveOccurred())
-			_, err = backend.StopJob(ctx, "job-stats-stopped", "stopped")
-			Expect(err).NotTo(HaveOccurred())
-			_, err = backend.FailJob(ctx, "job-stats-failed", "error")
-			Expect(err).NotTo(HaveOccurred())
+			// Verify we have exactly 1 pending job remaining
+			allJobs := []string{"job-stats-pending", "job-stats-running", "job-stats-completed", "job-stats-stopped", "job-stats-failed"}
+			dequeuedIDs := make(map[string]bool)
+			for _, job := range dequeuedJobs {
+				dequeuedIDs[job.ID] = true
+			}
+			var pendingJobID string
+			for _, jobID := range allJobs {
+				if !dequeuedIDs[jobID] {
+					pendingJobID = jobID
+					break
+				}
+			}
+			Expect(pendingJobID).NotTo(BeEmpty(), "One job should remain pending")
+
+			// Complete/stop/fail 3 of the dequeued jobs, leaving 1 running
+			// Use the actual dequeued jobs rather than assuming specific IDs
+			if len(dequeuedJobs) >= 3 {
+				_, err = backend.CompleteJob(ctx, dequeuedJobs[0].ID, []byte("done"))
+				Expect(err).NotTo(HaveOccurred())
+				_, err = backend.StopJob(ctx, dequeuedJobs[1].ID, "stopped")
+				Expect(err).NotTo(HaveOccurred())
+				_, err = backend.FailJob(ctx, dequeuedJobs[2].ID, "error")
+				Expect(err).NotTo(HaveOccurred())
+			}
 
 			stats, err := backend.GetJobStats(ctx, nil)
 			Expect(err).NotTo(HaveOccurred())
-			Expect(stats.TotalJobs).To(BeNumerically(">=", 5))
-			Expect(stats.PendingJobs).To(BeNumerically(">=", 1))
-			Expect(stats.RunningJobs).To(BeNumerically(">=", 1))
+			Expect(stats.TotalJobs).To(Equal(int32(5)))
+			// Verify the pending job still exists and is in INITIAL_PENDING state
+			pendingJob, err := backend.GetJob(ctx, pendingJobID)
+			Expect(err).NotTo(HaveOccurred(), "Pending job %s should still exist", pendingJobID)
+			Expect(pendingJob.Status).To(Equal(jobpool.JobStatusInitialPending), "Pending job %s should be in INITIAL_PENDING state, got %s", pendingJobID, pendingJob.Status)
+			Expect(stats.PendingJobs).To(Equal(int32(1)), "One job should remain pending: %s (actual pending: %d, running: %d, completed: %d, stopped: %d, failed: %d)", pendingJobID, stats.PendingJobs, stats.RunningJobs, stats.CompletedJobs, stats.StoppedJobs, stats.FailedJobs)
+			Expect(stats.RunningJobs).To(Equal(int32(1)), "One job should remain running")
 			Expect(stats.CompletedJobs).To(BeNumerically(">=", 1))
 			Expect(stats.StoppedJobs).To(BeNumerically(">=", 1))
 			Expect(stats.FailedJobs).To(BeNumerically(">=", 1))
@@ -2128,6 +2466,12 @@ func BackendTestSuite(backendFactory func() (jobpool.Backend, func())) {
 				_, err = backend.FailJob(ctx, "job-3", "error3")
 				Expect(err).NotTo(HaveOccurred())
 
+				// Reset job2 by stopping + deleting before re-enqueueing
+				_, err = backend.StopJob(ctx, "job-2", "reset for ordering test")
+				Expect(err).NotTo(HaveOccurred())
+				err = backend.DeleteJobs(ctx, nil, []string{"job-2"})
+				Expect(err).NotTo(HaveOccurred())
+
 				// Re-enqueue job2 (it was dequeued but we need it back)
 				job2Again := &jobpool.Job{
 					ID:            "job-2",
@@ -2182,6 +2526,12 @@ func BackendTestSuite(backendFactory func() (jobpool.Backend, func())) {
 				_, err = backend.DequeueJobs(ctx, "worker-temp", nil, 10)
 				Expect(err).NotTo(HaveOccurred())
 				_, err = backend.FailJob(ctx, "job-failed", "error")
+				Expect(err).NotTo(HaveOccurred())
+
+				// Reset job1 by stopping + deleting before re-enqueueing
+				_, err = backend.StopJob(ctx, "job-pending", "reset for ordering test")
+				Expect(err).NotTo(HaveOccurred())
+				err = backend.DeleteJobs(ctx, nil, []string{"job-pending"})
 				Expect(err).NotTo(HaveOccurred())
 
 				// Re-enqueue job1

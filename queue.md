@@ -479,15 +479,19 @@ StreamJobs blocks until one of the following occurs:
 **Postconditions**:
 - If `wasExecuting = true`:
   - Job status becomes `STOPPED`
+  - `FinalizedAt` timestamp set to current time (if not already set)
+  - Capacity is freed for the StreamJobs call that had this job assigned (job was actively executing when cancelled)
 - If `wasExecuting = false`:
   - Job status becomes `UNKNOWN_STOPPED`
-- Capacity freed for the StreamJobs call that had this job assigned
+  - `FinalizedAt` timestamp set to current time (if not already set)
+  - Capacity is not freed (job was not executing, so no capacity was held)
+- `AssigneeID` and `AssignedAt` are preserved (not cleared) for historical tracking
 - If job not found or not in `CANCELLING` state:
   - Returns error
 
 **Observable Effects**:
 - Job transitions to terminal state
-- Capacity increases for the StreamJobs call that had this job assigned
+- Capacity increases for the StreamJobs call that had this job assigned only if `wasExecuting=true` (job was actively executing when cancelled)
 
 **Backend Expectations**:
 - Must transition job from `CANCELLING` to `STOPPED` (if `wasExecuting=true`) or `UNKNOWN_STOPPED` (if `wasExecuting=false`) atomically
@@ -595,19 +599,25 @@ StreamJobs blocks until one of the following occurs:
 - `ctx` is a valid context
 
 **Postconditions**:
-- All `RUNNING` jobs transition to `UNKNOWN_RETRY`
+- All `RUNNING` jobs transition to `UNKNOWN_RETRY` (eligible for retry)
+- All `CANCELLING` jobs transition to `UNKNOWN_STOPPED` (terminal state, cancellation was in progress)
 - `AssigneeID` and `AssignedAt` are preserved (not cleared) for all affected jobs. To check if a job is currently assigned, check that `Status == RUNNING` rather than checking if `AssigneeID` is empty.
 - Returns error if operation fails
+- If no running or cancelling jobs exist:
+  - Operation is no-op (not an error)
 
 **Observable Effects**:
-- Jobs become eligible for scheduling
+- RUNNING jobs become eligible for scheduling (transition to UNKNOWN_RETRY)
+- CANCELLING jobs become terminal (transition to UNKNOWN_STOPPED)
+- Capacity is freed for workers (RUNNING jobs are unassigned and become eligible)
 - Workers may receive jobs via StreamJobs
 
 **Backend Expectations**:
-- Must find all jobs in `RUNNING` state
-- Must transition all `RUNNING` jobs to `UNKNOWN_RETRY` atomically
+- Must find all jobs in `RUNNING` state and transition them to `UNKNOWN_RETRY`
+- Must find all jobs in `CANCELLING` state and transition them to `UNKNOWN_STOPPED`
+- Must transition all jobs atomically (single transaction)
 - Must preserve `AssigneeID` and `AssignedAt` for all affected jobs (not cleared)
-- Must handle case where no running jobs exist (no-op, not an error)
+- Must handle case where no running or cancelling jobs exist (no-op, not an error)
 - Must support efficient querying by status and batch updates
 
 #### DeleteJobs

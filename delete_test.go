@@ -603,22 +603,22 @@ var _ = Describe("DeleteJobs", func() {
 
 	Describe("edge cases", func() {
 		Context("with empty tags and empty job IDs", func() {
-			It("should succeed without error", func() {
+			It("should return error when both tags and jobIDs are empty", func() {
 				// When: DeleteJobs is called with empty parameters
 				err := queue.DeleteJobs(ctx, nil, nil)
 
-				// Then: Should succeed (no-op)
-				Expect(err).NotTo(HaveOccurred())
+				// Then: Should return error (spec requires at least one filter)
+				Expect(err).To(HaveOccurred())
 			})
 		})
 
 		Context("with empty tags and empty job IDs slice", func() {
-			It("should succeed without error", func() {
+			It("should return error when both tags and jobIDs are empty", func() {
 				// When: DeleteJobs is called with empty slices
 				err := queue.DeleteJobs(ctx, []string{}, []string{})
 
-				// Then: Should succeed (no-op)
-				Expect(err).NotTo(HaveOccurred())
+				// Then: Should return error (spec requires at least one filter)
+				Expect(err).To(HaveOccurred())
 			})
 		})
 	})
