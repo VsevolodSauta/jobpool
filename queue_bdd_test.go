@@ -2366,6 +2366,80 @@ var _ = Describe("Queue Interface", func() {
 				Expect(err).NotTo(HaveOccurred())
 				Expect(retrieved.Status).To(Equal(jobpool.JobStatusUnknownStopped))
 			})
+
+			It("should discover pending jobs after restart when ResetRunningJobs called before workers connect", func() {
+				// This test verifies the post-registration notification mechanism
+				// Scenario: Service restarts, ResetRunningJobs is called before workers connect,
+				// then workers connect and should discover all pending jobs
+
+				// Enqueue multiple jobs
+				numJobs := 10
+				for i := 0; i < numJobs; i++ {
+					job := &jobpool.Job{
+						ID:            fmt.Sprintf("job-%d", i),
+						Status:        jobpool.JobStatusInitialPending,
+						JobType:       "test",
+						JobDefinition: []byte("test"),
+						Tags:          []string{"tag1"},
+						CreatedAt:     time.Now(),
+					}
+					_, err := queue.EnqueueJob(ctx, job)
+					Expect(err).NotTo(HaveOccurred())
+				}
+
+				// Assign some jobs to simulate they were running before restart
+				_, err := backend.DequeueJobs(ctx, "old-worker", []string{"tag1"}, 5)
+				Expect(err).NotTo(HaveOccurred())
+
+				// Simulate service restart: ResetRunningJobs called before workers connect
+				// This transitions RUNNING jobs to UNKNOWN_RETRY (eligible)
+				err = queue.ResetRunningJobs(ctx)
+				Expect(err).NotTo(HaveOccurred())
+
+				// Verify jobs are now eligible (UNKNOWN_RETRY or INITIAL_PENDING)
+				stats, err := queue.GetJobStats(ctx, []string{"tag1"})
+				Expect(err).NotTo(HaveOccurred())
+				// Should have 5 UNKNOWN_RETRY + 5 INITIAL_PENDING = 10 eligible jobs
+				Expect(stats.PendingJobs + stats.FailedJobs).To(Equal(int32(numJobs)))
+
+				// Now simulate worker connecting after restart
+				// The post-registration notification should ensure all pending jobs are discovered
+				jobChan := make(chan []*jobpool.Job, 20)
+				streamCtx, streamCancel := context.WithCancel(ctx)
+				defer streamCancel()
+
+				var wg sync.WaitGroup
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					_ = queue.StreamJobs(streamCtx, "new-worker", []string{"tag1"}, 10, jobChan)
+				}()
+
+				// Collect all received jobs
+				receivedJobs := make(map[string]bool)
+				timeout := time.After(3 * time.Second)
+			loop:
+				for len(receivedJobs) < numJobs {
+					select {
+					case jobs := <-jobChan:
+						for _, job := range jobs {
+							receivedJobs[job.ID] = true
+							Expect(job.Status).To(Equal(jobpool.JobStatusRunning))
+							Expect(job.AssigneeID).To(Equal("new-worker"))
+						}
+					case <-timeout:
+						break loop
+					}
+				}
+
+				// Should receive all jobs (initial dequeue + post-registration notification)
+				// The post-registration notification ensures jobs are discovered even if
+				// initial dequeue doesn't find all of them
+				Expect(len(receivedJobs)).To(Equal(numJobs), "All pending jobs should be discovered after restart")
+
+				streamCancel()
+				wg.Wait()
+			})
 		})
 
 		Context("DeleteJobs", func() {

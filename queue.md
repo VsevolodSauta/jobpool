@@ -217,6 +217,7 @@ The following sections specify the behavior of each Queue method using precondit
 
 **Observable Effects**:
 - Initial dequeue: If capacity available when StreamJobs starts, eligible jobs are immediately dequeued and sent
+- Post-registration notification: After the initial dequeue, if capacity is still available, the subscription is notified to trigger another dequeue attempt. This ensures that if there are many pending jobs (e.g., after service restart when ResetRunningJobs was called before workers connected), all eligible jobs will be discovered and processed. This is especially important when jobs are already pending in the queue when StreamJobs is first called
 - Capacity tracking: Capacity initialized to `maxAssignedJobs` when StreamJobs is called
 - Capacity decrement: When jobs are dequeued and assigned, capacity decreases by number of jobs assigned (capacity is decremented on assignment, not on channel send)
 - Capacity increment: When jobs are freed (via CompleteJob, FailJob, etc.), capacity increases (up to maxAssignedJobs)
@@ -610,6 +611,8 @@ StreamJobs blocks until one of the following occurs:
 - RUNNING jobs become eligible for scheduling (transition to UNKNOWN_RETRY)
 - CANCELLING jobs become terminal (transition to UNKNOWN_STOPPED)
 - Capacity is freed for workers (RUNNING jobs are unassigned and become eligible)
+- All active workers with matching tags are notified about newly eligible jobs
+- **Note**: If ResetRunningJobs is called before workers connect (e.g., during service startup), notifications are sent but no subscriptions exist yet. In this case, when workers later connect and call StreamJobs, the post-registration notification mechanism ensures they will discover and process the newly eligible jobs
 - Workers may receive jobs via StreamJobs
 
 **Backend Expectations**:
