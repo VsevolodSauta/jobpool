@@ -205,6 +205,7 @@ func (q *PoolQueue) StreamJobs(ctx context.Context, assigneeID string, tags []st
 	}
 
 	// Register subscription
+	q.logger.Debug("StreamJobs: registering subscription", "assigneeID", assigneeID, "tags", tags, "maxAssignedJobs", maxAssignedJobs)
 	sub := q.registerSubscription(assigneeID, tags, maxAssignedJobs, ch)
 	defer func() {
 		q.logger.Debug("StreamJobs: unregistering subscription", "assigneeID", assigneeID, "subID", sub.id)
@@ -212,8 +213,14 @@ func (q *PoolQueue) StreamJobs(ctx context.Context, assigneeID string, tags []st
 	}()
 
 	// Initial dequeue if capacity available
-	q.logger.Debug("StreamJobs: performing initial dequeue", "assigneeID", assigneeID, "subID", sub.id)
+	q.logger.Debug("StreamJobs: performing initial dequeue", "assigneeID", assigneeID, "subID", sub.id, "tags", tags, "maxCapacity", maxAssignedJobs)
 	q.tryDequeueForSubscription(ctx, sub)
+
+	// After registering a new subscription, notify it about any pending jobs
+	// This is especially important after service restart when jobs may already be pending
+	// and ResetRunningJobs was called before workers connected
+	q.logger.Debug("StreamJobs: notifying new subscription about pending jobs", "assigneeID", assigneeID, "subID", sub.id, "tags", tags)
+	q.notifyWorkersForSubscription(sub)
 
 	// Main loop: wait for notifications or context cancellation
 	q.logger.Debug("StreamJobs: entering main loop", "assigneeID", assigneeID, "subID", sub.id)
@@ -291,18 +298,30 @@ func (q *PoolQueue) tryDequeueForSubscription(ctx context.Context, sub *subscrip
 		}
 
 		// Dequeue jobs from backend
+		q.logger.Debug("tryDequeueForSubscription: calling DequeueJobs", "assigneeID", sub.assigneeID, "tags", sub.tags, "availableCapacity", availableCapacity)
 		jobs, err := q.backend.DequeueJobs(ctx, sub.assigneeID, sub.tags, availableCapacity)
 		if err != nil {
-			q.logger.Debug("tryDequeueForSubscription: DequeueJobs error", "error", err, "assigneeID", sub.assigneeID)
+			q.logger.Debug("tryDequeueForSubscription: DequeueJobs error", "error", err, "assigneeID", sub.assigneeID, "tags", sub.tags)
 			// Log error but don't fail - will retry on next notification
 			return
 		}
 
-		q.logger.Debug("tryDequeueForSubscription: DequeueJobs returned", "jobCount", len(jobs), "assigneeID", sub.assigneeID)
+		q.logger.Debug("tryDequeueForSubscription: DequeueJobs returned", "jobCount", len(jobs), "assigneeID", sub.assigneeID, "tags", sub.tags)
 		if len(jobs) == 0 {
-			q.logger.Debug("tryDequeueForSubscription: no jobs found, returning", "assigneeID", sub.assigneeID)
+			q.logger.Debug("tryDequeueForSubscription: no jobs found, returning", "assigneeID", sub.assigneeID, "tags", sub.tags, "availableCapacity", availableCapacity)
 			return
 		}
+
+		// Log job IDs and their tags for debugging
+		jobInfo := make([]map[string]interface{}, 0, len(jobs))
+		for _, job := range jobs {
+			jobInfo = append(jobInfo, map[string]interface{}{
+				"jobID":   job.ID,
+				"jobTags": job.Tags,
+				"status":  job.Status,
+			})
+		}
+		q.logger.Debug("tryDequeueForSubscription: jobs dequeued", "assigneeID", sub.assigneeID, "jobs", jobInfo)
 
 		// Update subscription capacity and track assigned jobs
 		sub.mu.Lock()
@@ -427,6 +446,30 @@ func (q *PoolQueue) notifyWorkers(jobTags []string) {
 		}
 	}
 	q.logger.Debug("notifyWorkers: completed", "notified", notifiedCount, "skippedNoMatch", skippedNoMatch, "skippedNoCapacity", skippedNoCapacity, "skippedFullChannel", skippedFullChannel)
+}
+
+// notifyWorkersForSubscription notifies a specific subscription about pending jobs.
+// This is used when a new subscription is registered to ensure it gets a chance to dequeue
+// any pending jobs that may have been missed in the initial dequeue.
+func (q *PoolQueue) notifyWorkersForSubscription(sub *subscription) {
+	sub.mu.Lock()
+	hasCapacity := sub.currentCapacity > 0
+	currentCap := sub.currentCapacity
+	sub.mu.Unlock()
+
+	if !hasCapacity {
+		q.logger.Debug("notifyWorkersForSubscription: skipping (no capacity)", "assigneeID", sub.assigneeID, "subID", sub.id, "capacity", currentCap)
+		return
+	}
+
+	// Send notification to this subscription (non-blocking, at-most-once)
+	select {
+	case sub.notifyCh <- struct{}{}:
+		q.logger.Debug("notifyWorkersForSubscription: notified subscription", "assigneeID", sub.assigneeID, "subID", sub.id, "capacity", currentCap)
+	default:
+		q.logger.Debug("notifyWorkersForSubscription: channel full (notification already pending)", "assigneeID", sub.assigneeID, "subID", sub.id)
+		// Channel full - notification already pending
+	}
 }
 
 // matchesTags checks if job tags contain all subscription tags (AND logic).

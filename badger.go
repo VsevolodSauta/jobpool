@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"strings"
 	"time"
 
 	"github.com/dgraph-io/badger/v4"
@@ -173,6 +172,8 @@ func (b *BadgerBackend) EnqueueJobs(ctx context.Context, jobs []*Job) ([]string,
 		job.Result = nil
 		job.RetryCount = 0
 		job.LastRetryAt = nil
+
+		b.logger.Debug("EnqueueJob: validated job for enqueue", "jobID", job.ID, "tags", job.Tags, "status", job.Status)
 	}
 
 	resultIDs := make([]string, 0, len(jobs))
@@ -260,6 +261,8 @@ func (b *BadgerBackend) DequeueJobs(ctx context.Context, assigneeID string, tags
 		return nil, fmt.Errorf("limit must be greater than 0")
 	}
 
+	b.logger.Debug("DequeueJobs: starting", "assigneeID", assigneeID, "tags", tags, "limit", limit)
+
 	// Helper function to check if job matches worker tags
 	// Returns true if all worker tags are present in job tags (subset check)
 	// Empty worker tags means accept all jobs
@@ -334,36 +337,12 @@ func (b *BadgerBackend) DequeueJobs(ctx context.Context, assigneeID string, tags
 				continue
 			}
 
-			// Load tags for this job (tags are stored separately, not in job JSON)
-			jobTags := make([]string, 0)
-			tagOpts := badger.DefaultIteratorOptions
-			tagOpts.Prefix = []byte(keyPrefixTag)
-			tagOpts.PrefetchValues = false
-			tagIt := txn.NewIterator(tagOpts)
-			for tagIt.Seek([]byte(keyPrefixTag)); tagIt.Valid(); tagIt.Next() {
-				key := tagIt.Item().Key()
-				// Extract job ID from tag key: "tag:<tag>:<jobID>"
-				keyStr := string(key)
-				keyParts := keyStr[len(keyPrefixTag):]
-				colonIdx := strings.Index(keyParts, ":")
-				if colonIdx > 0 {
-					tag := keyParts[:colonIdx]
-					taggedJobID := keyParts[colonIdx+1:]
-					if taggedJobID == job.ID {
-						jobTags = append(jobTags, tag)
-					} else if taggedJobID > job.ID {
-						// Tags are ordered, we can stop if we've passed this job ID
-						// (assuming lexicographic ordering of job IDs in tag keys)
-						break
-					}
-				}
-			}
-			tagIt.Close()
-			job.Tags = jobTags
-
 			if !matchesTags(job.Tags, tags) {
+				b.logger.Debug("DequeueJobs: job tags don't match worker tags", "jobID", job.ID, "jobTags", job.Tags, "workerTags", tags)
 				continue
 			}
+
+			b.logger.Debug("DequeueJobs: job matches tags, assigning", "jobID", job.ID, "jobTags", job.Tags, "workerTags", tags)
 
 			assignTime := time.Now()
 			job.AssigneeID = assigneeID
@@ -414,7 +393,23 @@ func (b *BadgerBackend) DequeueJobs(ctx context.Context, assigneeID string, tags
 		return nil
 	})
 	if err != nil {
+		b.logger.Debug("DequeueJobs: error", "assigneeID", assigneeID, "tags", tags, "error", err)
 		return nil, err
+	}
+
+	b.logger.Debug("DequeueJobs: completed", "assigneeID", assigneeID, "tags", tags, "assignedCount", len(assignedJobs))
+	if len(assignedJobs) > 0 {
+		jobInfo := make([]map[string]interface{}, 0, len(assignedJobs))
+		for _, job := range assignedJobs {
+			jobInfo = append(jobInfo, map[string]interface{}{
+				"jobID":   job.ID,
+				"jobTags": job.Tags,
+				"status":  job.Status,
+			})
+		}
+		b.logger.Debug("DequeueJobs: assigned jobs", "assigneeID", assigneeID, "jobs", jobInfo)
+	} else {
+		b.logger.Debug("DequeueJobs: no jobs assigned", "assigneeID", assigneeID, "tags", tags, "limit", limit)
 	}
 
 	return assignedJobs, nil
@@ -1024,7 +1019,6 @@ func (b *BadgerBackend) GetJobStats(ctx context.Context, tags []string) (*JobSta
 
 		return nil
 	})
-
 	if err != nil {
 		return nil, fmt.Errorf("failed to get job stats: %w", err)
 	}
@@ -1032,19 +1026,17 @@ func (b *BadgerBackend) GetJobStats(ctx context.Context, tags []string) (*JobSta
 	return stats, nil
 }
 
-// ResetRunningJobs marks all running and cancelling jobs as unknown (for service restart)
-// This is called when the service restarts and there are jobs that were in progress
-// RUNNING jobs -> UNKNOWN_RETRY (eligible for retry)
-// CANCELLING jobs -> UNKNOWN_STOPPED (terminal state, cancellation was in progress)
+// ResetRunningJobs marks running jobs as UNKNOWN_RETRY and cancelling jobs as UNKNOWN_STOPPED.
 func (b *BadgerBackend) ResetRunningJobs(ctx context.Context) error {
 	var err error
 	if ctx, err = normalizeContext(ctx); err != nil {
 		return err
 	}
-	return b.db.Update(func(txn *badger.Txn) error {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
+
+	runningIDs := make([]string, 0)
+	cancellingIDs := make([]string, 0)
+
+	err = b.db.View(func(txn *badger.Txn) error {
 		opts := badger.DefaultIteratorOptions
 		opts.Prefix = []byte(keyPrefixRunning)
 		opts.PrefetchValues = true
@@ -1053,9 +1045,6 @@ func (b *BadgerBackend) ResetRunningJobs(ctx context.Context) error {
 		defer it.Close()
 
 		for it.Rewind(); it.Valid(); it.Next() {
-			if err := ctx.Err(); err != nil {
-				return err
-			}
 			item := it.Item()
 			jobIDBytes, err := item.ValueCopy(nil)
 			if err != nil {
@@ -1063,7 +1052,6 @@ func (b *BadgerBackend) ResetRunningJobs(ctx context.Context) error {
 			}
 			jobID := string(jobIDBytes)
 
-			// Get job
 			jobItem, err := txn.Get(jobKey(jobID))
 			if err != nil {
 				continue
@@ -1079,32 +1067,88 @@ func (b *BadgerBackend) ResetRunningJobs(ctx context.Context) error {
 				continue
 			}
 
-			// Remove from running index
+			switch job.Status {
+			case JobStatusRunning:
+				runningIDs = append(runningIDs, jobID)
+			case JobStatusCancelling:
+				cancellingIDs = append(cancellingIDs, jobID)
+			default:
+				_ = txn.Delete(item.Key())
+			}
+		}
+
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+
+	b.logger.Debug("ResetRunningJobs: found jobs to reset", "runningCount", len(runningIDs), "cancellingCount", len(cancellingIDs))
+
+	return b.db.Update(func(txn *badger.Txn) error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+
+		opts := badger.DefaultIteratorOptions
+		opts.Prefix = []byte(keyPrefixRunning)
+		opts.PrefetchValues = true
+
+		it := txn.NewIterator(opts)
+		defer it.Close()
+
+		resetCount := 0
+		cancellingCount := 0
+
+		for it.Rewind(); it.Valid(); it.Next() {
+			item := it.Item()
+			jobIDBytes, err := item.ValueCopy(nil)
+			if err != nil {
+				continue
+			}
+			jobID := string(jobIDBytes)
+
+			jobItem, err := txn.Get(jobKey(jobID))
+			if err != nil {
+				_ = txn.Delete(item.Key())
+				continue
+			}
+
+			jobData, err := jobItem.ValueCopy(nil)
+			if err != nil {
+				_ = txn.Delete(item.Key())
+				continue
+			}
+
+			var job Job
+			if err := json.Unmarshal(jobData, &job); err != nil {
+				_ = txn.Delete(item.Key())
+				continue
+			}
+
 			_ = txn.Delete(item.Key())
 
-			if job.Status == JobStatusRunning {
-				// Mark as UNKNOWN_RETRY (eligible for retry)
+			switch job.Status {
+			case JobStatusRunning:
 				job.Status = JobStatusUnknownRetry
 				now := time.Now()
 				job.LastRetryAt = &now
+				resetCount++
 
-				// Add to pending index so it can be scheduled again
 				if err := txn.Set(pendingIndexKey(jobID, now.Unix()), []byte(jobID)); err != nil {
 					return fmt.Errorf("failed to add reset job to pending index: %w", err)
 				}
-			} else if job.Status == JobStatusCancelling {
-				// Mark as UNKNOWN_STOPPED (terminal state, cancellation was in progress)
+			case JobStatusCancelling:
 				job.Status = JobStatusUnknownStopped
 				now := time.Now()
 				if job.FinalizedAt == nil {
 					job.FinalizedAt = &now
 				}
-			} else {
-				// Skip other statuses
+				cancellingCount++
+			default:
 				continue
 			}
 
-			// Save updated job
 			updatedJobData, err := json.Marshal(&job)
 			if err != nil {
 				return fmt.Errorf("failed to marshal updated job: %w", err)
@@ -1114,6 +1158,8 @@ func (b *BadgerBackend) ResetRunningJobs(ctx context.Context) error {
 				return fmt.Errorf("failed to update job: %w", err)
 			}
 		}
+
+		b.logger.Debug("ResetRunningJobs: reset jobs", "runningCount", resetCount, "cancellingCount", cancellingCount)
 
 		return nil
 	})

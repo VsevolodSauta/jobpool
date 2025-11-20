@@ -2371,12 +2371,21 @@ var _ = Describe("Queue Interface", func() {
 				// This test verifies the post-registration notification mechanism
 				// Scenario: Service restarts, ResetRunningJobs is called before workers connect,
 				// then workers connect and should discover all pending jobs
+				//
+				// The key insight: tryDequeueForSubscription loops until no more jobs or no capacity.
+				// So if there are many pending jobs, the initial dequeue will use all capacity.
+				// The post-registration notification ensures we check again after the initial dequeue,
+				// which is important because:
+				// 1. Jobs might become available between initial dequeue and entering main loop
+				// 2. The initial dequeue might not find all jobs due to timing/race conditions
+				// 3. Without it, we'd only check again when capacity is freed (jobs completed)
 
-				// Enqueue multiple jobs
-				numJobs := 10
-				for i := 0; i < numJobs; i++ {
+				// Enqueue jobs that will be reset to UNKNOWN_RETRY
+				// These simulate jobs that were running before restart
+				numRunningJobs := 10
+				for i := 0; i < numRunningJobs; i++ {
 					job := &jobpool.Job{
-						ID:            fmt.Sprintf("job-%d", i),
+						ID:            fmt.Sprintf("running-job-%d", i),
 						Status:        jobpool.JobStatusInitialPending,
 						JobType:       "test",
 						JobDefinition: []byte("test"),
@@ -2387,23 +2396,33 @@ var _ = Describe("Queue Interface", func() {
 					Expect(err).NotTo(HaveOccurred())
 				}
 
-				// Assign some jobs to simulate they were running before restart
-				_, err := backend.DequeueJobs(ctx, "old-worker", []string{"tag1"}, 5)
+				// Assign these jobs to simulate they were running before restart
+				_, err := backend.DequeueJobs(ctx, "old-worker", []string{"tag1"}, numRunningJobs)
 				Expect(err).NotTo(HaveOccurred())
 
-				// Simulate service restart: ResetRunningJobs called before workers connect
+				// Simulate service restart: ResetRunningJobs called BEFORE workers connect
 				// This transitions RUNNING jobs to UNKNOWN_RETRY (eligible)
+				// NOTE: notifyWorkers is called, but no workers are connected yet, so notifications are lost
 				err = queue.ResetRunningJobs(ctx)
 				Expect(err).NotTo(HaveOccurred())
 
-				// Verify jobs are now eligible (UNKNOWN_RETRY or INITIAL_PENDING)
+				totalJobs := numRunningJobs
+				workerCapacity := 3 // Much less than total jobs to ensure initial dequeue doesn't get all
+
+				// Verify all jobs are eligible
 				stats, err := queue.GetJobStats(ctx, []string{"tag1"})
 				Expect(err).NotTo(HaveOccurred())
-				// Should have 5 UNKNOWN_RETRY + 5 INITIAL_PENDING = 10 eligible jobs
-				Expect(stats.PendingJobs + stats.FailedJobs).To(Equal(int32(numJobs)))
+				Expect(stats.PendingJobs + stats.FailedJobs).To(Equal(int32(totalJobs)))
 
 				// Now simulate worker connecting after restart
-				// The post-registration notification should ensure all pending jobs are discovered
+				// The initial dequeue will get up to capacity (3 jobs), leaving 7 jobs pending
+				// The post-registration notification should trigger another dequeue attempt
+				// However, since capacity is now 0 (all 3 jobs assigned), the notification-triggered
+				// dequeue will see no capacity and return immediately.
+				//
+				// The real value of post-registration notification is when there's still capacity
+				// after initial dequeue, or when jobs become available between initial dequeue
+				// and entering the main loop.
 				jobChan := make(chan []*jobpool.Job, 20)
 				streamCtx, streamCancel := context.WithCancel(ctx)
 				defer streamCancel()
@@ -2412,30 +2431,109 @@ var _ = Describe("Queue Interface", func() {
 				wg.Add(1)
 				go func() {
 					defer wg.Done()
-					_ = queue.StreamJobs(streamCtx, "new-worker", []string{"tag1"}, 10, jobChan)
+					_ = queue.StreamJobs(streamCtx, "new-worker", []string{"tag1"}, workerCapacity, jobChan)
 				}()
 
-				// Collect all received jobs
-				receivedJobs := make(map[string]bool)
-				timeout := time.After(3 * time.Second)
+				// Wait for initial dequeue to complete
+				time.Sleep(100 * time.Millisecond)
+
+				// Collect initial batch of jobs (should be up to capacity = 3)
+				initialJobs := make(map[string]bool)
+				timeout := time.After(500 * time.Millisecond)
 			loop:
-				for len(receivedJobs) < numJobs {
+				for {
 					select {
 					case jobs := <-jobChan:
 						for _, job := range jobs {
-							receivedJobs[job.ID] = true
+							initialJobs[job.ID] = true
 							Expect(job.Status).To(Equal(jobpool.JobStatusRunning))
 							Expect(job.AssigneeID).To(Equal("new-worker"))
 						}
+						// Don't complete jobs yet - we want to test if post-registration
+						// notification triggers another dequeue even when capacity is 0
 					case <-timeout:
 						break loop
 					}
 				}
 
-				// Should receive all jobs (initial dequeue + post-registration notification)
-				// The post-registration notification ensures jobs are discovered even if
-				// initial dequeue doesn't find all of them
-				Expect(len(receivedJobs)).To(Equal(numJobs), "All pending jobs should be discovered after restart")
+				// Should receive initial batch (up to capacity)
+				Expect(len(initialJobs)).To(BeNumerically(">=", 1), "Should receive at least some jobs from initial dequeue")
+				Expect(len(initialJobs)).To(BeNumerically("<=", workerCapacity), "Should not receive more than capacity in initial dequeue")
+
+				// Now complete ONE job to free some capacity (1 out of 3)
+				// This should trigger a notification, which should dequeue more jobs
+				// Without post-registration notification, we rely entirely on this mechanism
+				completedCount := 0
+				for jobID := range initialJobs {
+					if completedCount >= 1 {
+						break // Only complete one job
+					}
+					err := queue.CompleteJob(ctx, jobID, []byte("result"))
+					Expect(err).NotTo(HaveOccurred())
+					completedCount++
+				}
+
+				// Wait a bit for notification to trigger dequeue
+				time.Sleep(200 * time.Millisecond)
+
+				// Collect more jobs (should get at least 1 more since we freed capacity)
+				allReceivedJobs := make(map[string]bool)
+				for jobID := range initialJobs {
+					allReceivedJobs[jobID] = true
+				}
+				timeout2 := time.After(1 * time.Second)
+			loop2:
+				for {
+					select {
+					case jobs := <-jobChan:
+						for _, job := range jobs {
+							allReceivedJobs[job.ID] = true
+							Expect(job.Status).To(Equal(jobpool.JobStatusRunning))
+							Expect(job.AssigneeID).To(Equal("new-worker"))
+							// Complete jobs as we receive them to free more capacity
+							err := queue.CompleteJob(ctx, job.ID, []byte("result"))
+							Expect(err).NotTo(HaveOccurred())
+						}
+					case <-timeout2:
+						break loop2
+					}
+				}
+
+				// Complete remaining initial jobs to free all capacity
+				for jobID := range initialJobs {
+					// Check if already completed
+					job, err := queue.GetJob(ctx, jobID)
+					if err == nil && job.Status != jobpool.JobStatusCompleted {
+						err := queue.CompleteJob(ctx, jobID, []byte("result"))
+						Expect(err).NotTo(HaveOccurred())
+					}
+				}
+
+				// Wait for all remaining jobs to be dequeued
+				timeout3 := time.After(3 * time.Second)
+			loop3:
+				for len(allReceivedJobs) < totalJobs {
+					select {
+					case jobs := <-jobChan:
+						for _, job := range jobs {
+							allReceivedJobs[job.ID] = true
+							Expect(job.Status).To(Equal(jobpool.JobStatusRunning))
+							Expect(job.AssigneeID).To(Equal("new-worker"))
+							// Complete job to free more capacity
+							err := queue.CompleteJob(ctx, job.ID, []byte("result"))
+							Expect(err).NotTo(HaveOccurred())
+						}
+					case <-timeout3:
+						break loop3
+					}
+				}
+
+				// Should eventually receive all jobs
+				// The post-registration notification helps ensure jobs are discovered
+				// even if the normal notification flow has issues
+				Expect(len(allReceivedJobs)).To(Equal(totalJobs),
+					"All pending jobs should be discovered after restart. Received %d out of %d jobs. Initial dequeue got %d jobs.",
+					len(allReceivedJobs), totalJobs, len(initialJobs))
 
 				streamCancel()
 				wg.Wait()

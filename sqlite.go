@@ -99,6 +99,7 @@ func (b *SQLiteBackend) EnqueueJob(ctx context.Context, job *Job) (string, error
 	if job == nil {
 		return "", fmt.Errorf("job is nil")
 	}
+	b.logger.Debug("EnqueueJob: enqueuing job", "jobID", job.ID, "tags", job.Tags, "status", job.Status)
 	if job.ID == "" {
 		return "", fmt.Errorf("job ID is required")
 	}
@@ -291,6 +292,7 @@ func (b *SQLiteBackend) DequeueJobs(ctx context.Context, assigneeID string, tags
 }
 
 func (b *SQLiteBackend) dequeueJobsOnce(ctx context.Context, assigneeID string, tags []string, limit int) ([]*Job, error) {
+	b.logger.Debug("dequeueJobsOnce: starting", "assigneeID", assigneeID, "tags", tags, "limit", limit)
 	tx, err := b.db.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed to begin transaction: %w", err)
@@ -300,6 +302,7 @@ func (b *SQLiteBackend) dequeueJobsOnce(ctx context.Context, assigneeID string, 
 	now := time.Now().UnixNano()
 
 	query, args := buildDequeueQuery(tags, limit)
+	b.logger.Debug("dequeueJobsOnce: built query", "query", query, "args", args, "tags", tags, "limit", limit)
 
 	rows, err := tx.QueryContext(ctx, query, args...)
 	if err != nil {
@@ -356,8 +359,11 @@ func (b *SQLiteBackend) dequeueJobsOnce(ctx context.Context, assigneeID string, 
 	}
 
 	if len(jobIDs) == 0 {
+		b.logger.Debug("dequeueJobsOnce: no jobs found", "assigneeID", assigneeID, "tags", tags, "limit", limit)
 		return []*Job{}, nil
 	}
+
+	b.logger.Debug("dequeueJobsOnce: found jobs", "assigneeID", assigneeID, "tags", tags, "jobCount", len(jobIDs), "jobIDs", jobIDs)
 
 	updateArgs := make([]interface{}, 0, len(jobIDs)+4)
 	updateArgs = append(updateArgs, JobStatusRunning, assigneeID, now, now)
@@ -395,8 +401,10 @@ func (b *SQLiteBackend) dequeueJobsOnce(ctx context.Context, assigneeID string, 
 			started := assignedTime
 			job.StartedAt = &started
 		}
+		b.logger.Debug("dequeueJobsOnce: assigned job", "jobID", job.ID, "assigneeID", assigneeID, "jobTags", job.Tags, "requestedTags", tags)
 	}
 
+	b.logger.Debug("dequeueJobsOnce: completed", "assigneeID", assigneeID, "tags", tags, "assignedCount", len(jobs))
 	return jobs, nil
 }
 
@@ -962,8 +970,43 @@ func (b *SQLiteBackend) ResetRunningJobs(ctx context.Context) error {
 	if ctx, err = normalizeContext(ctx); err != nil {
 		return err
 	}
-	// Mark RUNNING jobs as UNKNOWN_RETRY
-	_, err = b.db.ExecContext(ctx, `
+	// First, query to see what jobs will be reset (for logging)
+	var runningJobIDs []string
+	rows, err := b.db.QueryContext(ctx, `SELECT id FROM jobs WHERE status = ?`, JobStatusRunning)
+	if err == nil {
+		defer rows.Close()
+		for rows.Next() {
+			var jobID string
+			if err := rows.Scan(&jobID); err == nil {
+				runningJobIDs = append(runningJobIDs, jobID)
+			}
+		}
+	}
+
+	var cancellingJobIDs []string
+	rows2, err := b.db.QueryContext(ctx, `SELECT id FROM jobs WHERE status = ?`, JobStatusCancelling)
+	if err == nil {
+		defer rows2.Close()
+		for rows2.Next() {
+			var jobID string
+			if err := rows2.Scan(&jobID); err == nil {
+				cancellingJobIDs = append(cancellingJobIDs, jobID)
+			}
+		}
+	}
+
+	b.logger.Debug("ResetRunningJobs: found jobs to reset", "runningCount", len(runningJobIDs), "cancellingCount", len(cancellingJobIDs))
+
+	// Log tags for running jobs
+	if len(runningJobIDs) > 0 {
+		for _, jobID := range runningJobIDs {
+			tags, _ := b.getJobTags(ctx, jobID)
+			b.logger.Debug("ResetRunningJobs: resetting RUNNING job", "jobID", jobID, "tags", tags)
+		}
+	}
+
+	// Mark RUNNING jobs as UNKNOWN_RETRY (assignee info preserved per spec)
+	result, err := b.db.ExecContext(ctx, `
 		UPDATE jobs
 		SET status = ?
 		WHERE status = ?
@@ -971,9 +1014,11 @@ func (b *SQLiteBackend) ResetRunningJobs(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("failed to reset running jobs: %w", err)
 	}
+	rowsAffected, _ := result.RowsAffected()
+	b.logger.Debug("ResetRunningJobs: reset RUNNING jobs", "rowsAffected", rowsAffected)
 
 	// Mark CANCELLING jobs as UNKNOWN_STOPPED
-	_, err = b.db.ExecContext(ctx, `
+	result2, err := b.db.ExecContext(ctx, `
 		UPDATE jobs
 		SET status = ?
 		WHERE status = ?
@@ -981,6 +1026,8 @@ func (b *SQLiteBackend) ResetRunningJobs(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("failed to reset cancelling jobs: %w", err)
 	}
+	rowsAffected2, _ := result2.RowsAffected()
+	b.logger.Debug("ResetRunningJobs: reset CANCELLING jobs", "rowsAffected", rowsAffected2)
 
 	return nil
 }
