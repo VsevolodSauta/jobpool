@@ -63,7 +63,7 @@ var _ = Describe("Atomic Job Lifecycle Methods", func() {
 
 				// When: Job is completed
 				result := []byte("success result")
-				err = queue.CompleteJob(ctx, "job-running-complete", result)
+				err = queue.CompleteJobs(ctx, map[string][]byte{"job-running-complete": result})
 
 				// Then: Job should be in COMPLETED state with result
 				Expect(err).NotTo(HaveOccurred())
@@ -96,7 +96,7 @@ var _ = Describe("Atomic Job Lifecycle Methods", func() {
 
 				// When: Job is completed (finished before cancellation took effect)
 				result := []byte("completed before cancellation")
-				err = queue.CompleteJob(ctx, "job-cancelling-complete", result)
+				err = queue.CompleteJobs(ctx, map[string][]byte{"job-cancelling-complete": result})
 
 				// Then: Job should be in COMPLETED state
 				Expect(err).NotTo(HaveOccurred())
@@ -126,7 +126,7 @@ var _ = Describe("Atomic Job Lifecycle Methods", func() {
 
 				// When: Job is completed after worker reconnection
 				result := []byte("completed after reconnect")
-				err = queue.CompleteJob(ctx, "job-unknown-retry-complete", result)
+				err = queue.CompleteJobs(ctx, map[string][]byte{"job-unknown-retry-complete": result})
 
 				// Then: Job should be in COMPLETED state
 				Expect(err).NotTo(HaveOccurred())
@@ -154,12 +154,12 @@ var _ = Describe("Atomic Job Lifecycle Methods", func() {
 				_, _, err = queue.CancelJobs(ctx, nil, []string{"job-unknown-stopped-complete"})
 				Expect(err).NotTo(HaveOccurred())
 				// Mark as unknown stopped (simulating timeout)
-				err = queue.MarkJobUnknownStopped(ctx, "job-unknown-stopped-complete", "timeout")
+				err = queue.MarkJobsUnknownStopped(ctx, map[string]string{"job-unknown-stopped-complete": "timeout"})
 				Expect(err).NotTo(HaveOccurred())
 
 				// When: Job is completed despite previous issues
 				result := []byte("completed despite issues")
-				err = queue.CompleteJob(ctx, "job-unknown-stopped-complete", result)
+				err = queue.CompleteJobs(ctx, map[string][]byte{"job-unknown-stopped-complete": result})
 
 				// Then: Job should be in COMPLETED state
 				Expect(err).NotTo(HaveOccurred())
@@ -184,7 +184,7 @@ var _ = Describe("Atomic Job Lifecycle Methods", func() {
 				Expect(err).NotTo(HaveOccurred())
 
 				// When: Attempting to complete a pending job
-				err = queue.CompleteJob(ctx, "job-pending-invalid", []byte("result"))
+				err = queue.CompleteJobs(ctx, map[string][]byte{"job-pending-invalid": []byte("result")})
 
 				// Then: An error should be returned
 				Expect(err).To(HaveOccurred())
@@ -212,7 +212,7 @@ var _ = Describe("Atomic Job Lifecycle Methods", func() {
 
 				// When: Job fails
 				errorMsg := "test error"
-				err = queue.FailJob(ctx, "job-running-fail", errorMsg)
+				err = queue.FailJobs(ctx, map[string]string{"job-running-fail": errorMsg})
 
 				// Then: Job should be in FAILED_RETRY state with incremented retry count
 				// Jobs never return to INITIAL_PENDING once they leave it
@@ -248,7 +248,7 @@ var _ = Describe("Atomic Job Lifecycle Methods", func() {
 
 				// When: Job fails after worker reconnection
 				errorMsg := "error after reconnect"
-				err = queue.FailJob(ctx, "job-unknown-retry-fail", errorMsg)
+				err = queue.FailJobs(ctx, map[string]string{"job-unknown-retry-fail": errorMsg})
 
 				// Then: Job should be in FAILED_RETRY state with incremented retry count
 				// Jobs never return to INITIAL_PENDING once they leave it
@@ -275,7 +275,7 @@ var _ = Describe("Atomic Job Lifecycle Methods", func() {
 				Expect(err).NotTo(HaveOccurred())
 
 				// When: Attempting to fail a pending job
-				err = queue.FailJob(ctx, "job-pending-fail-invalid", "error")
+				err = queue.FailJobs(ctx, map[string]string{"job-pending-fail-invalid": "error"})
 
 				// Then: An error should be returned
 				Expect(err).To(HaveOccurred())
@@ -302,7 +302,7 @@ var _ = Describe("Atomic Job Lifecycle Methods", func() {
 
 				// When: Job is stopped
 				errorMsg := "cancelled by user"
-				err = queue.StopJob(ctx, "job-running-stop", errorMsg)
+				err = queue.StopJobs(ctx, map[string]string{"job-running-stop": errorMsg})
 
 				// Then: Job should be in STOPPED state
 				Expect(err).NotTo(HaveOccurred())
@@ -335,7 +335,7 @@ var _ = Describe("Atomic Job Lifecycle Methods", func() {
 
 				// When: Cancellation is acknowledged (job was executing)
 				errorMsg := "cancelled: acknowledged by worker"
-				err = queue.StopJob(ctx, "job-cancelling-stop", errorMsg)
+				err = queue.StopJobs(ctx, map[string]string{"job-cancelling-stop": errorMsg})
 
 				// Then: Job should be in STOPPED state
 				Expect(err).NotTo(HaveOccurred())
@@ -365,7 +365,7 @@ var _ = Describe("Atomic Job Lifecycle Methods", func() {
 
 				// When: Job is stopped
 				errorMsg := "cancelled: acknowledged by worker"
-				err = queue.StopJob(ctx, "job-unknown-retry-stop", errorMsg)
+				err = queue.StopJobs(ctx, map[string]string{"job-unknown-retry-stop": errorMsg})
 
 				// Then: Job should be in STOPPED state
 				Expect(err).NotTo(HaveOccurred())
@@ -390,7 +390,7 @@ var _ = Describe("Atomic Job Lifecycle Methods", func() {
 				Expect(err).NotTo(HaveOccurred())
 
 				// When: Attempting to stop a pending job
-				err = queue.StopJob(ctx, "job-pending-stop-invalid", "error")
+				err = queue.StopJobs(ctx, map[string]string{"job-pending-stop-invalid": "error"})
 
 				// Then: An error should be returned
 				Expect(err).To(HaveOccurred())
@@ -420,7 +420,7 @@ var _ = Describe("Atomic Job Lifecycle Methods", func() {
 
 				// When: Job fails while being cancelled (applies FAILED_RETRY state effects)
 				errorMsg := "job failed while being cancelled"
-				err = queue.StopJobWithRetry(ctx, "job-cancelling-stop-retry", errorMsg)
+				err = queue.StopJobsWithRetry(ctx, map[string]string{"job-cancelling-stop-retry": errorMsg})
 
 				// Then: Job should be in STOPPED state with incremented retry count
 				Expect(err).NotTo(HaveOccurred())
@@ -450,7 +450,7 @@ var _ = Describe("Atomic Job Lifecycle Methods", func() {
 				Expect(err).NotTo(HaveOccurred())
 
 				// When: Attempting to stop with retry from RUNNING state
-				err = queue.StopJobWithRetry(ctx, "job-running-stop-retry-invalid", "error")
+				err = queue.StopJobsWithRetry(ctx, map[string]string{"job-running-stop-retry-invalid": "error"})
 
 				// Then: An error should be returned
 				Expect(err).To(HaveOccurred())
@@ -479,7 +479,7 @@ var _ = Describe("Atomic Job Lifecycle Methods", func() {
 
 				// When: Cancellation times out (job unknown to worker)
 				errorMsg := "cancelled: timeout waiting for worker acknowledgment"
-				err = queue.MarkJobUnknownStopped(ctx, "job-cancelling-unknown-stopped", errorMsg)
+				err = queue.MarkJobsUnknownStopped(ctx, map[string]string{"job-cancelling-unknown-stopped": errorMsg})
 
 				// Then: Job should be in UNKNOWN_STOPPED state
 				Expect(err).NotTo(HaveOccurred())
@@ -512,7 +512,7 @@ var _ = Describe("Atomic Job Lifecycle Methods", func() {
 
 				// When: Job is unknown to worker during cancellation
 				errorMsg := "cancelled: job unknown to worker"
-				err = queue.MarkJobUnknownStopped(ctx, "job-unknown-retry-unknown-stopped", errorMsg)
+				err = queue.MarkJobsUnknownStopped(ctx, map[string]string{"job-unknown-retry-unknown-stopped": errorMsg})
 
 				// Then: Job should be in UNKNOWN_STOPPED state
 				Expect(err).NotTo(HaveOccurred())
@@ -540,7 +540,7 @@ var _ = Describe("Atomic Job Lifecycle Methods", func() {
 
 				// When: Worker not connected (fallback case)
 				errorMsg := "cancelled: worker not connected (fallback - indicates service bug)"
-				err = queue.MarkJobUnknownStopped(ctx, "job-running-unknown-stopped", errorMsg)
+				err = queue.MarkJobsUnknownStopped(ctx, map[string]string{"job-running-unknown-stopped": errorMsg})
 
 				// Then: Job should be in UNKNOWN_STOPPED state
 				Expect(err).NotTo(HaveOccurred())
@@ -569,7 +569,7 @@ var _ = Describe("Atomic Job Lifecycle Methods", func() {
 				Expect(err).NotTo(HaveOccurred())
 				_, _, err = queue.CancelJobs(ctx, nil, []string{"job-update-status"})
 				Expect(err).NotTo(HaveOccurred())
-				err = queue.MarkJobUnknownStopped(ctx, "job-update-status", "timeout")
+				err = queue.MarkJobsUnknownStopped(ctx, map[string]string{"job-update-status": "timeout"})
 				Expect(err).NotTo(HaveOccurred())
 
 				// When: Updating to STOPPED (edge case transition)
@@ -604,7 +604,7 @@ var _ = Describe("Atomic Job Lifecycle Methods", func() {
 				Expect(err).NotTo(HaveOccurred())
 				err = queue.MarkWorkerUnresponsive(ctx, "worker-1")
 				Expect(err).NotTo(HaveOccurred())
-				err = queue.MarkJobUnknownStopped(ctx, "job-update-eligible", "timeout")
+				err = queue.MarkJobsUnknownStopped(ctx, map[string]string{"job-update-eligible": "timeout"})
 				Expect(err).NotTo(HaveOccurred())
 
 				// When: Updating to INITIAL_PENDING (becomes eligible)
@@ -660,12 +660,12 @@ var _ = Describe("Atomic Job Lifecycle Methods", func() {
 						Expect(err).NotTo(HaveOccurred())
 						_, _, err = queue.CancelJobs(ctx, nil, []string{jobID})
 						Expect(err).NotTo(HaveOccurred())
-						err = queue.MarkJobUnknownStopped(ctx, jobID, "timeout")
+						err = queue.MarkJobsUnknownStopped(ctx, map[string]string{jobID: "timeout"})
 					}
 					Expect(err).NotTo(HaveOccurred())
 
-					// When: Using CompleteJob
-					err = queue.CompleteJob(ctx, jobID, []byte("result"))
+					// When: Using CompleteJobs
+					err = queue.CompleteJobs(ctx, map[string][]byte{jobID: []byte("result")})
 
 					// Then: Should succeed
 					Expect(err).NotTo(HaveOccurred())
@@ -731,8 +731,8 @@ var _ = Describe("Atomic Job Lifecycle Methods", func() {
 						Expect(jobBefore.Status).To(Equal(jobpool.JobStatusUnknownRetry))
 					}
 
-					// When: Using FailJob
-					err = queue.FailJob(ctx, jobID, "error")
+					// When: Using FailJobs
+					err = queue.FailJobs(ctx, map[string]string{jobID: "error"})
 
 					// Then: Should succeed and transition to FAILED_RETRY
 					// Jobs never return to INITIAL_PENDING once they leave it
@@ -762,8 +762,8 @@ var _ = Describe("Atomic Job Lifecycle Methods", func() {
 				_, _, err = queue.CancelJobs(ctx, nil, []string{"job-cancel-stop"})
 				Expect(err).NotTo(HaveOccurred())
 
-				// When: Using StopJob (normal cancellation acknowledgment)
-				err = queue.StopJob(ctx, "job-cancel-stop", "cancelled: acknowledged")
+				// When: Using StopJobs (normal cancellation acknowledgment)
+				err = queue.StopJobs(ctx, map[string]string{"job-cancel-stop": "cancelled: acknowledged"})
 
 				// Then: Should succeed
 				Expect(err).NotTo(HaveOccurred())
@@ -792,8 +792,8 @@ var _ = Describe("Atomic Job Lifecycle Methods", func() {
 				_, _, err = queue.CancelJobs(ctx, nil, []string{"job-cancel-fail-stop"})
 				Expect(err).NotTo(HaveOccurred())
 
-				// When: Using StopJobWithRetry (job failed while being cancelled)
-				err = queue.StopJobWithRetry(ctx, "job-cancel-fail-stop", "failed while cancelling")
+				// When: Using StopJobsWithRetry (job failed while being cancelled)
+				err = queue.StopJobsWithRetry(ctx, map[string]string{"job-cancel-fail-stop": "failed while cancelling"})
 
 				// Then: Should succeed with retry increment
 				Expect(err).NotTo(HaveOccurred())
@@ -833,11 +833,11 @@ var _ = Describe("Atomic Job Lifecycle Methods", func() {
 				Expect(err).NotTo(HaveOccurred())
 
 				// When: Using AcknowledgeCancellation (wasExecuting=true)
-				err = queue.AcknowledgeCancellation(ctx, "job-ack-1", true)
+				err = queue.AcknowledgeCancellation(ctx, map[string]bool{"job-ack-1": true})
 				Expect(err).NotTo(HaveOccurred())
 
-				// And: Using StopJob (equivalent)
-				err = queue.StopJob(ctx, "job-ack-2", "cancelled: acknowledged by worker")
+				// And: Using StopJobs (equivalent)
+				err = queue.StopJobs(ctx, map[string]string{"job-ack-2": "cancelled: acknowledged by worker"})
 				Expect(err).NotTo(HaveOccurred())
 
 				// Then: Both should result in STOPPED state
@@ -878,11 +878,11 @@ var _ = Describe("Atomic Job Lifecycle Methods", func() {
 				Expect(err).NotTo(HaveOccurred())
 
 				// When: Using AcknowledgeCancellation (wasExecuting=false)
-				err = queue.AcknowledgeCancellation(ctx, "job-ack-unknown-1", false)
+				err = queue.AcknowledgeCancellation(ctx, map[string]bool{"job-ack-unknown-1": false})
 				Expect(err).NotTo(HaveOccurred())
 
-				// And: Using MarkJobUnknownStopped (equivalent)
-				err = queue.MarkJobUnknownStopped(ctx, "job-ack-unknown-2", "cancelled: job unknown to worker")
+				// And: Using MarkJobsUnknownStopped (equivalent)
+				err = queue.MarkJobsUnknownStopped(ctx, map[string]string{"job-ack-unknown-2": "cancelled: job unknown to worker"})
 				Expect(err).NotTo(HaveOccurred())
 
 				// Then: Both should result in UNKNOWN_STOPPED state
@@ -913,8 +913,8 @@ var _ = Describe("Atomic Job Lifecycle Methods", func() {
 				_, _, err = queue.CancelJobs(ctx, nil, []string{"job-prefer-atomic"})
 				Expect(err).NotTo(HaveOccurred())
 
-				// When: Using StopJob directly (preferred for direct control)
-				err = queue.StopJob(ctx, "job-prefer-atomic", "custom error message")
+				// When: Using StopJobs directly (preferred for direct control)
+				err = queue.StopJobs(ctx, map[string]string{"job-prefer-atomic": "custom error message"})
 
 				// Then: Should succeed with custom error message
 				Expect(err).NotTo(HaveOccurred())

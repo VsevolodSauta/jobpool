@@ -20,22 +20,23 @@ type Queue interface {
 	StreamJobs(ctx context.Context, assigneeID string, tags []string, maxAssignedJobs int, ch chan<- []*Job) error
 
 	// Job lifecycle
-	CompleteJob(ctx context.Context, jobID string, result []byte) error
-	FailJob(ctx context.Context, jobID string, errorMsg string) error
-	StopJob(ctx context.Context, jobID string, errorMsg string) error
-	StopJobWithRetry(ctx context.Context, jobID string, errorMsg string) error
-	MarkJobUnknownStopped(ctx context.Context, jobID string, errorMsg string) error
+	CompleteJobs(ctx context.Context, jobID2result map[string][]byte) error
+	FailJobs(ctx context.Context, jobID2errorMsg map[string]string) error
+	StopJobs(ctx context.Context, jobID2errorMsg map[string]string) error
+	StopJobsWithRetry(ctx context.Context, jobID2errorMsg map[string]string) error
+	MarkJobsUnknownStopped(ctx context.Context, jobID2errorMsg map[string]string) error
 	UpdateJobStatus(ctx context.Context, jobID string, status JobStatus, result []byte, errorMsg string) error
 
 	// Cancellation
 	CancelJobs(ctx context.Context, tags []string, jobIDs []string) ([]string, []string, error)
-	AcknowledgeCancellation(ctx context.Context, jobID string, wasExecuting bool) error
+	AcknowledgeCancellation(ctx context.Context, jobIDs2wasExecuting map[string]bool) error
 
 	// Worker management
 	MarkWorkerUnresponsive(ctx context.Context, assigneeID string) error
 
 	// Query operations
 	GetJob(ctx context.Context, jobID string) (*Job, error)
+	GetJobs(ctx context.Context, jobIDs []string) ([]*Job, error)
 	GetJobStats(ctx context.Context, tags []string) (*JobStats, error)
 
 	// Maintenance
@@ -56,6 +57,9 @@ type subscription struct {
 	ch              chan<- []*Job
 	assignedJobs    map[string]bool // job IDs assigned to this subscription
 	notifyCh        chan struct{}   // notification channel for this subscription
+	done            chan struct{}   // closed when StreamJobs exits
+	dequeuing       bool            // true if tryDequeueForSubscription is currently running
+	chClosed        bool            // true if channel is closed (to prevent sending to closed channel)
 	mu              sync.Mutex
 }
 
@@ -209,6 +213,7 @@ func (q *PoolQueue) StreamJobs(ctx context.Context, assigneeID string, tags []st
 	sub := q.registerSubscription(assigneeID, tags, maxAssignedJobs, ch)
 	defer func() {
 		q.logger.Debug("StreamJobs: unregistering subscription", "assigneeID", assigneeID, "subID", sub.id)
+		close(sub.done) // Signal that StreamJobs has exited
 		q.unregisterSubscription(sub.id)
 	}()
 
@@ -229,17 +234,52 @@ func (q *PoolQueue) StreamJobs(ctx context.Context, assigneeID string, tags []st
 		case <-ctx.Done():
 			// Context cancelled - cleanup assigned but undelivered jobs
 			q.logger.Debug("StreamJobs: context cancelled", "assigneeID", assigneeID, "subID", sub.id, "error", ctx.Err())
-			q.cleanupSubscriptionJobs(ctx, sub)
+			// Mark channel as closed to prevent tryDequeueForSubscription from sending to it
+			sub.mu.Lock()
+			sub.chClosed = true
+			sub.mu.Unlock()
+			// Run cleanup in goroutine to avoid blocking StreamJobs exit
+			// This allows StreamJobs to exit immediately
+			go q.cleanupSubscriptionJobs(ctx, sub)
 			close(ch)
 			return ctx.Err()
 		case <-sub.notifyCh:
 			// Notification received - try to dequeue jobs
 			q.logger.Debug("StreamJobs: notification received", "assigneeID", sub.assigneeID, "subID", sub.id)
-			q.tryDequeueForSubscription(ctx, sub)
+			// Check if already dequeuing to avoid concurrent dequeues
+			sub.mu.Lock()
+			dequeuing := sub.dequeuing
+			if !dequeuing {
+				sub.dequeuing = true
+			}
+			sub.mu.Unlock()
+
+			if dequeuing {
+				// Already dequeuing, skip this notification
+				q.logger.Debug("StreamJobs: already dequeuing, skipping notification", "assigneeID", sub.assigneeID, "subID", sub.id)
+				continue
+			}
+
+			// Run tryDequeueForSubscription in a goroutine to avoid blocking the select loop
+			// This allows StreamJobs to check ctx.Done() even if tryDequeueForSubscription is blocking
+			go func() {
+				defer func() {
+					sub.mu.Lock()
+					sub.dequeuing = false
+					sub.mu.Unlock()
+				}()
+				q.tryDequeueForSubscription(ctx, sub)
+			}()
 		case <-q.closeCh:
 			// Queue closed
 			q.logger.Debug("StreamJobs: queue closed", "assigneeID", assigneeID, "subID", sub.id)
-			q.cleanupSubscriptionJobs(ctx, sub)
+			// Mark channel as closed to prevent tryDequeueForSubscription from sending to it
+			sub.mu.Lock()
+			sub.chClosed = true
+			sub.mu.Unlock()
+			// Run cleanup in goroutine to avoid blocking StreamJobs exit
+			// This allows StreamJobs to exit immediately when queue is closed
+			go q.cleanupSubscriptionJobs(ctx, sub)
 			close(ch)
 			return nil
 		}
@@ -261,6 +301,7 @@ func (q *PoolQueue) registerSubscription(assigneeID string, tags []string, maxCa
 		ch:              ch,
 		assignedJobs:    make(map[string]bool),
 		notifyCh:        make(chan struct{}, 1), // buffered for non-blocking
+		done:            make(chan struct{}),    // closed when StreamJobs exits
 	}
 	q.nextSubID++
 	q.subscriptions[sub.id] = sub
@@ -281,12 +322,31 @@ func (q *PoolQueue) unregisterSubscription(subID uint64) {
 		q.logger.Debug("unregisterSubscription: subID not found", "subID", subID)
 	}
 	delete(q.subscriptions, subID)
+	// Note: We rely on context cancellation in StreamJobs to exit properly
+	// The subscription is removed from the map, so no new notifications will be sent to it
 }
 
 // tryDequeueForSubscription attempts to dequeue jobs for a subscription.
 func (q *PoolQueue) tryDequeueForSubscription(ctx context.Context, sub *subscription) {
 	q.logger.Debug("tryDequeueForSubscription", "assigneeID", sub.assigneeID, "subID", sub.id)
 	for {
+		// Check context cancellation first
+		select {
+		case <-ctx.Done():
+			q.logger.Debug("tryDequeueForSubscription: context cancelled", "assigneeID", sub.assigneeID, "error", ctx.Err())
+			return
+		default:
+		}
+
+		// Check if queue is closed - if so, exit immediately
+		q.mu.RLock()
+		queueClosed := q.closed
+		q.mu.RUnlock()
+		if queueClosed {
+			q.logger.Debug("tryDequeueForSubscription: queue closed, exiting", "assigneeID", sub.assigneeID)
+			return
+		}
+
 		sub.mu.Lock()
 		availableCapacity := sub.currentCapacity
 		sub.mu.Unlock()
@@ -297,9 +357,19 @@ func (q *PoolQueue) tryDequeueForSubscription(ctx context.Context, sub *subscrip
 			return
 		}
 
-		// Dequeue jobs from backend
+		// Dequeue jobs from backend - this may block, but we check queue closed status before and after
 		q.logger.Debug("tryDequeueForSubscription: calling DequeueJobs", "assigneeID", sub.assigneeID, "tags", sub.tags, "availableCapacity", availableCapacity)
 		jobs, err := q.backend.DequeueJobs(ctx, sub.assigneeID, sub.tags, availableCapacity)
+
+		// Check if queue was closed during the database operation
+		q.mu.RLock()
+		queueClosed = q.closed
+		q.mu.RUnlock()
+		if queueClosed {
+			q.logger.Debug("tryDequeueForSubscription: queue closed during DequeueJobs, exiting", "assigneeID", sub.assigneeID)
+			return
+		}
+
 		if err != nil {
 			q.logger.Debug("tryDequeueForSubscription: DequeueJobs error", "error", err, "assigneeID", sub.assigneeID, "tags", sub.tags)
 			// Log error but don't fail - will retry on next notification
@@ -332,10 +402,23 @@ func (q *PoolQueue) tryDequeueForSubscription(ctx context.Context, sub *subscrip
 		}
 		sub.mu.Unlock()
 
+		// Check if channel is closed before trying to send
+		sub.mu.Lock()
+		chClosed := sub.chClosed
+		sub.mu.Unlock()
+		if chClosed {
+			q.logger.Debug("tryDequeueForSubscription: channel closed, exiting", "assigneeID", sub.assigneeID)
+			return
+		}
+
 		// Send jobs to channel
 		// If channel is full, jobs are still assigned (per spec) but we'll retry sending
 		q.logger.Debug("tryDequeueForSubscription: sending jobs to channel", "jobCount", len(jobs), "assigneeID", sub.assigneeID)
 		select {
+		case <-ctx.Done():
+			// Context cancelled, exit immediately
+			q.logger.Debug("tryDequeueForSubscription: context cancelled", "assigneeID", sub.assigneeID, "error", ctx.Err())
+			return
 		case sub.ch <- jobs:
 			q.logger.Debug("tryDequeueForSubscription: successfully sent jobs to channel", "jobCount", len(jobs), "assigneeID", sub.assigneeID)
 			// Successfully sent - continue to check if more capacity is available
@@ -345,6 +428,10 @@ func (q *PoolQueue) tryDequeueForSubscription(ctx context.Context, sub *subscrip
 			// Channel full - jobs are still assigned and will be sent later
 			// Schedule a retry by sending a notification
 			select {
+			case <-ctx.Done():
+				// Context cancelled, exit immediately
+				q.logger.Debug("tryDequeueForSubscription: context cancelled while scheduling retry", "assigneeID", sub.assigneeID, "error", ctx.Err())
+				return
 			case sub.notifyCh <- struct{}{}:
 			default:
 				// Notification channel also full, will retry on next external notification
@@ -355,9 +442,12 @@ func (q *PoolQueue) tryDequeueForSubscription(ctx context.Context, sub *subscrip
 }
 
 // cleanupSubscriptionJobs transitions RUNNING jobs assigned to this subscription to FAILED_RETRY.
+// This function is called asynchronously (in a goroutine) to avoid blocking StreamJobs exit.
 func (q *PoolQueue) cleanupSubscriptionJobs(ctx context.Context, sub *subscription) {
 	q.logger.Debug("cleanupSubscriptionJobs", "assigneeID", sub.assigneeID, "subID", sub.id)
-	cleanupCtx := context.WithoutCancel(ctx)
+	// Use background context with timeout to ensure cleanup completes but doesn't hang forever
+	cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
 	sub.mu.Lock()
 	jobIDs := make([]string, 0, len(sub.assignedJobs))
 	for jobID := range sub.assignedJobs {
@@ -492,163 +582,311 @@ func matchesTags(jobTags []string, subTags []string) bool {
 	return true
 }
 
-// CompleteJob completes a job and frees capacity.
-func (q *PoolQueue) CompleteJob(ctx context.Context, jobID string, result []byte) error {
-	q.logger.Debug("CompleteJob", "jobID", jobID)
-	// Get job before completion to get tags for notification
-	job, err := q.backend.GetJob(ctx, jobID)
-	if err != nil {
-		return err
+// CompleteJobs completes multiple jobs and frees capacity.
+func (q *PoolQueue) CompleteJobs(ctx context.Context, jobID2result map[string][]byte) error {
+	q.logger.Debug("CompleteJobs", "count", len(jobID2result))
+	if len(jobID2result) == 0 {
+		q.logger.Debug("CompleteJobs: empty map, returning")
+		return nil
 	}
-	jobTags := job.Tags
-	q.logger.Debug("CompleteJob", "jobID", jobID, "assigneeID", job.AssigneeID, "tags", jobTags)
 
-	// Complete job in backend
-	freedAssigneeIDs, err := q.backend.CompleteJob(ctx, jobID, result)
-	if err != nil {
-		return err
+	// Aggregate freed capacity and collect unique tag combinations
+	allFreedAssigneeIDs := make(map[string]int)
+	tagCombos := make(map[string]bool) // Track unique tag combinations by key
+	var firstError error
+
+	// Process each job
+	for jobID, result := range jobID2result {
+		// Get job before completion to get tags for notification
+		job, err := q.backend.GetJob(ctx, jobID)
+		if err != nil {
+			q.logger.Debug("CompleteJobs: GetJob error", "jobID", jobID, "error", err)
+			if firstError == nil {
+				firstError = err
+			}
+			continue
+		}
+		jobTags := job.Tags
+		q.logger.Debug("CompleteJobs", "jobID", jobID, "assigneeID", job.AssigneeID, "tags", jobTags)
+
+		// Complete job in backend
+		freedAssigneeIDs, err := q.backend.CompleteJob(ctx, jobID, result)
+		if err != nil {
+			q.logger.Debug("CompleteJobs: backend.CompleteJob error", "jobID", jobID, "error", err)
+			if firstError == nil {
+				firstError = err
+			}
+			continue
+		}
+		q.logger.Debug("CompleteJobs: backend returned freedAssigneeIDs", "freedAssigneeIDs", freedAssigneeIDs, "jobID", jobID)
+
+		// Aggregate freed capacity
+		for assigneeID, count := range freedAssigneeIDs {
+			allFreedAssigneeIDs[assigneeID] += count
+		}
+
+		// Collect unique tag combinations
+		comboKey := tagComboKey(jobTags)
+		tagCombos[comboKey] = true
 	}
-	q.logger.Debug("CompleteJob: backend returned freedAssigneeIDs", "freedAssigneeIDs", freedAssigneeIDs, "jobID", jobID)
 
-	// Free capacity for affected subscriptions and notify
-	q.freeCapacityAndNotify(freedAssigneeIDs, jobTags)
+	// Notify workers - use nil to notify all workers since we have multiple tag combinations
+	// This ensures all eligible workers are notified regardless of their tag filters
+	if len(tagCombos) > 0 || len(allFreedAssigneeIDs) > 0 {
+		q.freeCapacityAndNotify(allFreedAssigneeIDs, nil)
+	}
+
+	if firstError != nil {
+		q.logger.Debug("CompleteJobs: some jobs failed", "error", firstError)
+		return firstError
+	}
 
 	return nil
 }
 
-// FailJob fails a job and frees capacity.
-func (q *PoolQueue) FailJob(ctx context.Context, jobID string, errorMsg string) error {
-	q.logger.Debug("FailJob", "jobID", jobID, "errorMsg", errorMsg)
-	if errorMsg == "" {
-		return fmt.Errorf("errorMsg is required")
+// FailJobs fails multiple jobs and frees capacity.
+func (q *PoolQueue) FailJobs(ctx context.Context, jobID2errorMsg map[string]string) error {
+	q.logger.Debug("FailJobs", "count", len(jobID2errorMsg))
+	if len(jobID2errorMsg) == 0 {
+		q.logger.Debug("FailJobs: empty map, returning")
+		return nil
 	}
 
-	// Get job before failure to get tags for notification
-	job, err := q.backend.GetJob(ctx, jobID)
-	if err != nil {
-		q.logger.Debug("FailJob: GetJob error", "jobID", jobID, "error", err)
-		return err
-	}
-	q.logger.Debug("FailJob", "jobID", jobID, "currentStatus", job.Status, "assigneeID", job.AssigneeID, "tags", job.Tags)
-	jobTags := job.Tags
-
-	// Fail job in backend
-	freedAssigneeIDs, err := q.backend.FailJob(ctx, jobID, errorMsg)
-	if err != nil {
-		q.logger.Debug("FailJob: backend.FailJob error", "jobID", jobID, "error", err)
-		return err
-	}
-	q.logger.Debug("FailJob: backend.FailJob returned freedAssigneeIDs", "freedAssigneeIDs", freedAssigneeIDs, "jobID", jobID)
-
-	// Verify job state after backend operation
-	jobAfter, err := q.backend.GetJob(ctx, jobID)
-	if err != nil {
-		q.logger.Debug("FailJob: GetJob after FailJob error", "jobID", jobID, "error", err)
-	} else {
-		q.logger.Debug("FailJob: status after FailJob", "jobID", jobID, "status", jobAfter.Status)
+	// Validate all error messages first
+	for jobID, errorMsg := range jobID2errorMsg {
+		if errorMsg == "" {
+			return fmt.Errorf("errorMsg is required for job %s", jobID)
+		}
 	}
 
-	// Free capacity for affected subscriptions and notify
-	q.freeCapacityAndNotify(freedAssigneeIDs, jobTags)
+	// Aggregate freed capacity and collect unique tag combinations
+	allFreedAssigneeIDs := make(map[string]int)
+	tagCombos := make(map[string]bool)
+	var firstError error
+
+	// Process each job
+	for jobID, errorMsg := range jobID2errorMsg {
+		// Get job before failure to get tags for notification
+		job, err := q.backend.GetJob(ctx, jobID)
+		if err != nil {
+			q.logger.Debug("FailJobs: GetJob error", "jobID", jobID, "error", err)
+			if firstError == nil {
+				firstError = err
+			}
+			continue
+		}
+		q.logger.Debug("FailJobs", "jobID", jobID, "currentStatus", job.Status, "assigneeID", job.AssigneeID, "tags", job.Tags)
+
+		// Fail job in backend
+		freedAssigneeIDs, err := q.backend.FailJob(ctx, jobID, errorMsg)
+		if err != nil {
+			q.logger.Debug("FailJobs: backend.FailJob error", "jobID", jobID, "error", err)
+			if firstError == nil {
+				firstError = err
+			}
+			continue
+		}
+		q.logger.Debug("FailJobs: backend.FailJob returned freedAssigneeIDs", "freedAssigneeIDs", freedAssigneeIDs, "jobID", jobID)
+
+		// Aggregate freed capacity
+		for assigneeID, count := range freedAssigneeIDs {
+			allFreedAssigneeIDs[assigneeID] += count
+		}
+
+		// Collect unique tag combinations
+		comboKey := tagComboKey(job.Tags)
+		tagCombos[comboKey] = true
+	}
+
+	// Notify workers - use nil to notify all workers since we have multiple tag combinations
+	if len(tagCombos) > 0 || len(allFreedAssigneeIDs) > 0 {
+		q.freeCapacityAndNotify(allFreedAssigneeIDs, nil)
+	}
+
+	if firstError != nil {
+		q.logger.Debug("FailJobs: some jobs failed", "error", firstError)
+		return firstError
+	}
 
 	return nil
 }
 
-// StopJob stops a job and frees capacity.
-func (q *PoolQueue) StopJob(ctx context.Context, jobID string, errorMsg string) error {
-	q.logger.Debug("StopJob", "jobID", jobID, "errorMsg", errorMsg)
-	// Get job before stopping
-	job, err := q.backend.GetJob(ctx, jobID)
-	if err != nil {
-		q.logger.Debug("StopJob: GetJob error", "jobID", jobID, "error", err)
-		return err
-	}
-	q.logger.Debug("StopJob", "jobID", jobID, "currentStatus", job.Status, "assigneeID", job.AssigneeID, "tags", job.Tags)
-
-	// Stop job in backend
-	freedAssigneeIDs, err := q.backend.StopJob(ctx, jobID, errorMsg)
-	if err != nil {
-		q.logger.Debug("StopJob: backend.StopJob error", "jobID", jobID, "error", err)
-		return err
-	}
-	q.logger.Debug("StopJob: backend.StopJob returned freedAssigneeIDs", "freedAssigneeIDs", freedAssigneeIDs, "jobID", jobID)
-
-	// Verify job state after backend operation
-	jobAfter, err := q.backend.GetJob(ctx, jobID)
-	if err != nil {
-		q.logger.Debug("StopJob: GetJob after StopJob error", "jobID", jobID, "error", err)
-	} else {
-		q.logger.Debug("StopJob: status after StopJob", "jobID", jobID, "status", jobAfter.Status, "assigneeID", jobAfter.AssigneeID)
+// StopJobs stops multiple jobs and frees capacity.
+func (q *PoolQueue) StopJobs(ctx context.Context, jobID2errorMsg map[string]string) error {
+	q.logger.Debug("StopJobs", "count", len(jobID2errorMsg))
+	if len(jobID2errorMsg) == 0 {
+		q.logger.Debug("StopJobs: empty map, returning")
+		return nil
 	}
 
-	// Free capacity for affected subscriptions
-	q.freeCapacityAndNotify(freedAssigneeIDs, job.Tags)
+	// Aggregate freed capacity and collect unique tag combinations
+	allFreedAssigneeIDs := make(map[string]int)
+	tagCombos := make(map[string]bool)
+	var firstError error
+
+	// Process each job
+	for jobID, errorMsg := range jobID2errorMsg {
+		// Get job before stopping
+		job, err := q.backend.GetJob(ctx, jobID)
+		if err != nil {
+			q.logger.Debug("StopJobs: GetJob error", "jobID", jobID, "error", err)
+			if firstError == nil {
+				firstError = err
+			}
+			continue
+		}
+		q.logger.Debug("StopJobs", "jobID", jobID, "currentStatus", job.Status, "assigneeID", job.AssigneeID, "tags", job.Tags)
+
+		// Stop job in backend
+		freedAssigneeIDs, err := q.backend.StopJob(ctx, jobID, errorMsg)
+		if err != nil {
+			q.logger.Debug("StopJobs: backend.StopJob error", "jobID", jobID, "error", err)
+			if firstError == nil {
+				firstError = err
+			}
+			continue
+		}
+		q.logger.Debug("StopJobs: backend.StopJob returned freedAssigneeIDs", "freedAssigneeIDs", freedAssigneeIDs, "jobID", jobID)
+
+		// Aggregate freed capacity
+		for assigneeID, count := range freedAssigneeIDs {
+			allFreedAssigneeIDs[assigneeID] += count
+		}
+
+		// Collect unique tag combinations
+		comboKey := tagComboKey(job.Tags)
+		tagCombos[comboKey] = true
+	}
+
+	// Notify workers - use nil to notify all workers since we have multiple tag combinations
+	if len(tagCombos) > 0 || len(allFreedAssigneeIDs) > 0 {
+		q.freeCapacityAndNotify(allFreedAssigneeIDs, nil)
+	}
+
+	if firstError != nil {
+		q.logger.Debug("StopJobs: some jobs failed", "error", firstError)
+		return firstError
+	}
 
 	return nil
 }
 
-// StopJobWithRetry stops a job with retry increment and frees capacity.
-func (q *PoolQueue) StopJobWithRetry(ctx context.Context, jobID string, errorMsg string) error {
-	q.logger.Debug("StopJobWithRetry", "jobID", jobID, "errorMsg", errorMsg)
-	// Get job before stopping
-	job, err := q.backend.GetJob(ctx, jobID)
-	if err != nil {
-		q.logger.Debug("StopJobWithRetry: GetJob error", "jobID", jobID, "error", err)
-		return err
-	}
-	q.logger.Debug("StopJobWithRetry", "jobID", jobID, "currentStatus", job.Status, "assigneeID", job.AssigneeID, "tags", job.Tags)
-
-	// Stop job with retry in backend
-	freedAssigneeIDs, err := q.backend.StopJobWithRetry(ctx, jobID, errorMsg)
-	if err != nil {
-		q.logger.Debug("StopJobWithRetry: backend.StopJobWithRetry error", "jobID", jobID, "error", err)
-		return err
-	}
-	q.logger.Debug("StopJobWithRetry: backend.StopJobWithRetry returned freedAssigneeIDs", "freedAssigneeIDs", freedAssigneeIDs, "jobID", jobID)
-
-	// Verify job state after backend operation
-	jobAfter, err := q.backend.GetJob(ctx, jobID)
-	if err != nil {
-		q.logger.Debug("StopJobWithRetry: GetJob after StopJobWithRetry error", "jobID", jobID, "error", err)
-	} else {
-		q.logger.Debug("StopJobWithRetry: status after StopJobWithRetry", "jobID", jobID, "status", jobAfter.Status)
+// StopJobsWithRetry stops multiple jobs with retry increment and frees capacity.
+func (q *PoolQueue) StopJobsWithRetry(ctx context.Context, jobID2errorMsg map[string]string) error {
+	q.logger.Debug("StopJobsWithRetry", "count", len(jobID2errorMsg))
+	if len(jobID2errorMsg) == 0 {
+		q.logger.Debug("StopJobsWithRetry: empty map, returning")
+		return nil
 	}
 
-	// Free capacity for affected subscriptions
-	q.freeCapacityAndNotify(freedAssigneeIDs, job.Tags)
+	// Aggregate freed capacity and collect unique tag combinations
+	allFreedAssigneeIDs := make(map[string]int)
+	tagCombos := make(map[string]bool)
+	var firstError error
+
+	// Process each job
+	for jobID, errorMsg := range jobID2errorMsg {
+		// Get job before stopping
+		job, err := q.backend.GetJob(ctx, jobID)
+		if err != nil {
+			q.logger.Debug("StopJobsWithRetry: GetJob error", "jobID", jobID, "error", err)
+			if firstError == nil {
+				firstError = err
+			}
+			continue
+		}
+		q.logger.Debug("StopJobsWithRetry", "jobID", jobID, "currentStatus", job.Status, "assigneeID", job.AssigneeID, "tags", job.Tags)
+
+		// Stop job with retry in backend
+		freedAssigneeIDs, err := q.backend.StopJobWithRetry(ctx, jobID, errorMsg)
+		if err != nil {
+			q.logger.Debug("StopJobsWithRetry: backend.StopJobWithRetry error", "jobID", jobID, "error", err)
+			if firstError == nil {
+				firstError = err
+			}
+			continue
+		}
+		q.logger.Debug("StopJobsWithRetry: backend.StopJobWithRetry returned freedAssigneeIDs", "freedAssigneeIDs", freedAssigneeIDs, "jobID", jobID)
+
+		// Aggregate freed capacity
+		for assigneeID, count := range freedAssigneeIDs {
+			allFreedAssigneeIDs[assigneeID] += count
+		}
+
+		// Collect unique tag combinations
+		comboKey := tagComboKey(job.Tags)
+		tagCombos[comboKey] = true
+	}
+
+	// Notify workers - use nil to notify all workers since we have multiple tag combinations
+	if len(tagCombos) > 0 || len(allFreedAssigneeIDs) > 0 {
+		q.freeCapacityAndNotify(allFreedAssigneeIDs, nil)
+	}
+
+	if firstError != nil {
+		q.logger.Debug("StopJobsWithRetry: some jobs failed", "error", firstError)
+		return firstError
+	}
 
 	return nil
 }
 
-// MarkJobUnknownStopped marks a job as unknown stopped and frees capacity.
-func (q *PoolQueue) MarkJobUnknownStopped(ctx context.Context, jobID string, errorMsg string) error {
-	q.logger.Debug("MarkJobUnknownStopped", "jobID", jobID, "errorMsg", errorMsg)
-	// Get job before marking
-	job, err := q.backend.GetJob(ctx, jobID)
-	if err != nil {
-		q.logger.Debug("MarkJobUnknownStopped: GetJob error", "jobID", jobID, "error", err)
-		return err
-	}
-	q.logger.Debug("MarkJobUnknownStopped", "jobID", jobID, "currentStatus", job.Status, "assigneeID", job.AssigneeID, "tags", job.Tags)
-
-	// Mark job in backend
-	freedAssigneeIDs, err := q.backend.MarkJobUnknownStopped(ctx, jobID, errorMsg)
-	if err != nil {
-		q.logger.Debug("MarkJobUnknownStopped: backend.MarkJobUnknownStopped error", "jobID", jobID, "error", err)
-		return err
-	}
-	q.logger.Debug("MarkJobUnknownStopped: backend.MarkJobUnknownStopped returned freedAssigneeIDs", "freedAssigneeIDs", freedAssigneeIDs, "jobID", jobID)
-
-	// Verify job state after backend operation
-	jobAfter, err := q.backend.GetJob(ctx, jobID)
-	if err != nil {
-		q.logger.Debug("MarkJobUnknownStopped: GetJob after MarkJobUnknownStopped error", "jobID", jobID, "error", err)
-	} else {
-		q.logger.Debug("MarkJobUnknownStopped: status after MarkJobUnknownStopped", "jobID", jobID, "status", jobAfter.Status)
+// MarkJobsUnknownStopped marks multiple jobs as unknown stopped and frees capacity.
+func (q *PoolQueue) MarkJobsUnknownStopped(ctx context.Context, jobID2errorMsg map[string]string) error {
+	q.logger.Debug("MarkJobsUnknownStopped", "count", len(jobID2errorMsg))
+	if len(jobID2errorMsg) == 0 {
+		q.logger.Debug("MarkJobsUnknownStopped: empty map, returning")
+		return nil
 	}
 
-	// Free capacity for affected subscriptions
-	q.freeCapacityAndNotify(freedAssigneeIDs, job.Tags)
+	// Aggregate freed capacity and collect unique tag combinations
+	allFreedAssigneeIDs := make(map[string]int)
+	tagCombos := make(map[string]bool)
+	var firstError error
+
+	// Process each job
+	for jobID, errorMsg := range jobID2errorMsg {
+		// Get job before marking
+		job, err := q.backend.GetJob(ctx, jobID)
+		if err != nil {
+			q.logger.Debug("MarkJobsUnknownStopped: GetJob error", "jobID", jobID, "error", err)
+			if firstError == nil {
+				firstError = err
+			}
+			continue
+		}
+		q.logger.Debug("MarkJobsUnknownStopped", "jobID", jobID, "currentStatus", job.Status, "assigneeID", job.AssigneeID, "tags", job.Tags)
+
+		// Mark job in backend
+		freedAssigneeIDs, err := q.backend.MarkJobUnknownStopped(ctx, jobID, errorMsg)
+		if err != nil {
+			q.logger.Debug("MarkJobsUnknownStopped: backend.MarkJobUnknownStopped error", "jobID", jobID, "error", err)
+			if firstError == nil {
+				firstError = err
+			}
+			continue
+		}
+		q.logger.Debug("MarkJobsUnknownStopped: backend.MarkJobUnknownStopped returned freedAssigneeIDs", "freedAssigneeIDs", freedAssigneeIDs, "jobID", jobID)
+
+		// Aggregate freed capacity
+		for assigneeID, count := range freedAssigneeIDs {
+			allFreedAssigneeIDs[assigneeID] += count
+		}
+
+		// Collect unique tag combinations
+		comboKey := tagComboKey(job.Tags)
+		tagCombos[comboKey] = true
+	}
+
+	// Notify workers - use nil to notify all workers since we have multiple tag combinations
+	if len(tagCombos) > 0 || len(allFreedAssigneeIDs) > 0 {
+		q.freeCapacityAndNotify(allFreedAssigneeIDs, nil)
+	}
+
+	if firstError != nil {
+		q.logger.Debug("MarkJobsUnknownStopped: some jobs failed", "error", firstError)
+		return firstError
+	}
 
 	return nil
 }
@@ -724,30 +962,64 @@ func (q *PoolQueue) CancelJobs(ctx context.Context, tags []string, jobIDs []stri
 	return cancelledByTags, cancelledByIDs, err
 }
 
-// AcknowledgeCancellation handles cancellation acknowledgment.
-func (q *PoolQueue) AcknowledgeCancellation(ctx context.Context, jobID string, wasExecuting bool) error {
-	q.logger.Debug("AcknowledgeCancellation", "jobID", jobID, "wasExecuting", wasExecuting)
-	// Get job before acknowledgment
-	job, err := q.backend.GetJob(ctx, jobID)
-	if err != nil {
-		q.logger.Debug("AcknowledgeCancellation: GetJob error", "jobID", jobID, "error", err)
-		return err
+// AcknowledgeCancellation handles cancellation acknowledgment for multiple jobs.
+func (q *PoolQueue) AcknowledgeCancellation(ctx context.Context, jobIDs2wasExecuting map[string]bool) error {
+	q.logger.Debug("AcknowledgeCancellation", "count", len(jobIDs2wasExecuting))
+	if len(jobIDs2wasExecuting) == 0 {
+		q.logger.Debug("AcknowledgeCancellation: empty map, returning")
+		return nil
 	}
-	q.logger.Debug("AcknowledgeCancellation", "jobID", jobID, "currentStatus", job.Status, "assigneeID", job.AssigneeID, "tags", job.Tags)
 
-	// Acknowledge in backend
-	err = q.backend.AcknowledgeCancellation(ctx, jobID, wasExecuting)
-	if err != nil {
-		q.logger.Debug("AcknowledgeCancellation: backend error", "jobID", jobID, "error", err)
-		return err
+	// Aggregate freed capacity and collect unique tag combinations
+	allFreedAssigneeIDs := make(map[string]int)
+	tagCombos := make(map[string]bool)
+	var firstError error
+
+	// Process each job
+	for jobID, wasExecuting := range jobIDs2wasExecuting {
+		// Get job before acknowledgment
+		job, err := q.backend.GetJob(ctx, jobID)
+		if err != nil {
+			q.logger.Debug("AcknowledgeCancellation: GetJob error", "jobID", jobID, "error", err)
+			if firstError == nil {
+				firstError = err
+			}
+			continue
+		}
+		q.logger.Debug("AcknowledgeCancellation", "jobID", jobID, "currentStatus", job.Status, "assigneeID", job.AssigneeID, "tags", job.Tags, "wasExecuting", wasExecuting)
+
+		// Acknowledge in backend
+		err = q.backend.AcknowledgeCancellation(ctx, jobID, wasExecuting)
+		if err != nil {
+			q.logger.Debug("AcknowledgeCancellation: backend error", "jobID", jobID, "error", err)
+			if firstError == nil {
+				firstError = err
+			}
+			continue
+		}
+		q.logger.Debug("AcknowledgeCancellation: backend successfully acknowledged cancellation", "jobID", jobID)
+
+		// Free capacity if job was executing
+		if wasExecuting && job.AssigneeID != "" {
+			allFreedAssigneeIDs[job.AssigneeID]++
+			q.logger.Debug("AcknowledgeCancellation: freeing capacity", "assigneeID", job.AssigneeID)
+		}
+
+		// Collect unique tag combinations (only if capacity was freed)
+		if wasExecuting {
+			comboKey := tagComboKey(job.Tags)
+			tagCombos[comboKey] = true
+		}
 	}
-	q.logger.Debug("AcknowledgeCancellation: backend successfully acknowledged cancellation", "jobID", jobID)
 
-	// Free capacity if job was executing
-	if wasExecuting {
-		freedAssigneeIDs := map[string]int{job.AssigneeID: 1}
-		q.logger.Debug("AcknowledgeCancellation: freeing capacity", "assigneeID", job.AssigneeID)
-		q.freeCapacityAndNotify(freedAssigneeIDs, job.Tags)
+	// Notify workers - use nil to notify all workers since we have multiple tag combinations
+	if len(tagCombos) > 0 || len(allFreedAssigneeIDs) > 0 {
+		q.freeCapacityAndNotify(allFreedAssigneeIDs, nil)
+	}
+
+	if firstError != nil {
+		q.logger.Debug("AcknowledgeCancellation: some jobs failed", "error", firstError)
+		return firstError
 	}
 
 	return nil
@@ -808,6 +1080,38 @@ func (q *PoolQueue) GetJob(ctx context.Context, jobID string) (*Job, error) {
 		q.logger.Debug("GetJob", "jobID", jobID, "status", job.Status)
 	}
 	return job, err
+}
+
+// GetJobs retrieves multiple jobs by IDs.
+func (q *PoolQueue) GetJobs(ctx context.Context, jobIDs []string) ([]*Job, error) {
+	q.logger.Debug("GetJobs", "count", len(jobIDs))
+	if len(jobIDs) == 0 {
+		q.logger.Debug("GetJobs: empty slice, returning")
+		return []*Job{}, nil
+	}
+
+	jobs := make([]*Job, 0, len(jobIDs))
+	var firstError error
+
+	for _, jobID := range jobIDs {
+		job, err := q.backend.GetJob(ctx, jobID)
+		if err != nil {
+			q.logger.Debug("GetJobs: GetJob error", "jobID", jobID, "error", err)
+			if firstError == nil {
+				firstError = err
+			}
+			continue
+		}
+		jobs = append(jobs, job)
+	}
+
+	if firstError != nil && len(jobs) == 0 {
+		// All jobs failed
+		return nil, firstError
+	}
+
+	q.logger.Debug("GetJobs: completed", "requested", len(jobIDs), "found", len(jobs))
+	return jobs, firstError
 }
 
 // GetJobStats gets statistics for jobs matching tags.
@@ -903,18 +1207,36 @@ func (q *PoolQueue) Close() error {
 	q.closed = true
 	close(q.closeCh)
 	// Build defensive copy of subscriptions to release lock quickly
-	// (not used, but prevents holding lock during backend.Close())
 	subs := make([]*subscription, 0, len(q.subscriptions))
 	for _, sub := range q.subscriptions {
 		subs = append(subs, sub)
 	}
-	_ = subs // Intentionally unused - defensive copy to release lock
 	q.mu.Unlock()
 
 	// Close all subscription channels
 	// Note: StreamJobs will close the channels when it detects queue closure
 	// We don't close them here to avoid double-close issues
 
+	// Wait for all StreamJobs to exit after seeing q.closeCh
+	// This prevents backend.Close() from blocking on active database operations
+	// StreamJobs should exit quickly when it sees q.closeCh in its select statement
+	deadline := time.Now().Add(2 * time.Second)
+	for _, sub := range subs {
+		select {
+		case <-sub.done:
+			// StreamJobs exited
+		case <-time.After(time.Until(deadline)):
+			// Timeout waiting for StreamJobs to exit
+			q.logger.Warn("Timeout waiting for StreamJobs to exit", "assigneeID", sub.assigneeID, "subID", sub.id)
+		}
+		// Don't wait longer than deadline
+		if time.Now().After(deadline) {
+			break
+		}
+	}
+
 	// Close backend
+	// Note: If there are still active operations, this may block briefly,
+	// but we've waited for StreamJobs to exit, so it should be safe
 	return q.backend.Close()
 }

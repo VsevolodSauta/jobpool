@@ -14,4 +14,3 @@ func TestJobPool(t *testing.T) {
 	RegisterFailHandler(Fail)
 	RunSpecs(t, "JobPool Suite")
 }
-

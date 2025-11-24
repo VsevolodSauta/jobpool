@@ -64,7 +64,7 @@ var _ = Describe("CleanupExpiredJobs", func() {
 				Expect(err).NotTo(HaveOccurred())
 				_, err = backend.DequeueJobs(ctx, "worker-1", nil, 1)
 				Expect(err).NotTo(HaveOccurred())
-				err = queue.CompleteJob(ctx, "job-old-completed", []byte("result"))
+				err = queue.CompleteJobs(ctx, map[string][]byte{"job-old-completed": []byte("result")})
 				Expect(err).NotTo(HaveOccurred())
 
 				// Set finalized_at to 2 hours ago using test helper
@@ -84,7 +84,7 @@ var _ = Describe("CleanupExpiredJobs", func() {
 				Expect(err).NotTo(HaveOccurred())
 				_, err = backend.DequeueJobs(ctx, "worker-1", nil, 1)
 				Expect(err).NotTo(HaveOccurred())
-				err = queue.CompleteJob(ctx, "job-recent-completed", []byte("result"))
+				err = queue.CompleteJobs(ctx, map[string][]byte{"job-recent-completed": []byte("result")})
 				Expect(err).NotTo(HaveOccurred())
 
 				// When: CleanupExpiredJobs is called with 1 hour TTL
@@ -151,7 +151,7 @@ var _ = Describe("CleanupExpiredJobs", func() {
 				Expect(len(dequeued)).To(Equal(1))
 				Expect(dequeued[0].ID).To(Equal("job-old-stopped"))
 				// Now stop it (job is now RUNNING)
-				err = queue.StopJob(ctx, "job-old-stopped", "stopped")
+				err = queue.StopJobs(ctx, map[string]string{"job-old-stopped": "stopped"})
 				Expect(err).NotTo(HaveOccurred())
 
 				// When: CleanupExpiredJobs is called
@@ -188,7 +188,7 @@ var _ = Describe("CleanupExpiredJobs", func() {
 				Expect(err).NotTo(HaveOccurred())
 				_, err = backend.DequeueJobs(ctx, "worker-1", nil, 1)
 				Expect(err).NotTo(HaveOccurred())
-				err = queue.CompleteJob(ctx, "job-recent", []byte("result"))
+				err = queue.CompleteJobs(ctx, map[string][]byte{"job-recent": []byte("result")})
 				Expect(err).NotTo(HaveOccurred())
 
 				// When: CleanupExpiredJobs is called with long TTL
@@ -233,7 +233,7 @@ var _ = Describe("CleanupExpiredJobs", func() {
 					Expect(err).NotTo(HaveOccurred())
 					_, err = backend.DequeueJobs(ctx, "worker-1", nil, 1)
 					Expect(err).NotTo(HaveOccurred())
-					err = queue.CompleteJob(ctx, jobID, []byte("result"))
+					err = queue.CompleteJobs(ctx, map[string][]byte{jobID: []byte("result")})
 					Expect(err).NotTo(HaveOccurred())
 
 					// Set finalized_at to 2 hours ago
@@ -272,7 +272,7 @@ var _ = Describe("CleanupExpiredJobs", func() {
 					Expect(err).NotTo(HaveOccurred())
 					_, err = backend.DequeueJobs(ctx, "worker-1", nil, 1)
 					Expect(err).NotTo(HaveOccurred())
-					err = queue.CompleteJob(ctx, jobID, []byte("result"))
+					err = queue.CompleteJobs(ctx, map[string][]byte{jobID: []byte("result")})
 					Expect(err).NotTo(HaveOccurred())
 				}
 

@@ -140,7 +140,7 @@ var _ = Describe("Job Cancellation", func() {
 				// Dequeue to make it RUNNING, then complete
 				_, err = backend.DequeueJobs(ctx, "worker-1", nil, 1)
 				Expect(err).NotTo(HaveOccurred())
-				err = queue.CompleteJob(ctx, "job-3", []byte("result"))
+				err = queue.CompleteJobs(ctx, map[string][]byte{"job-3": []byte("result")})
 				Expect(err).NotTo(HaveOccurred())
 
 				// When: The job is cancelled
@@ -333,7 +333,7 @@ var _ = Describe("Job Cancellation", func() {
 				Expect(err).NotTo(HaveOccurred())
 
 				// When: Job status is updated to completed (from CANCELLING state)
-				err = queue.CompleteJob(ctx, "job-cancelling-complete", []byte("result"))
+				err = queue.CompleteJobs(ctx, map[string][]byte{"job-cancelling-complete": []byte("result")})
 				Expect(err).NotTo(HaveOccurred())
 
 				// Then: Job status should be completed
@@ -361,7 +361,7 @@ var _ = Describe("Job Cancellation", func() {
 				Expect(err).NotTo(HaveOccurred())
 
 				// When: Cancellation is acknowledged (was executing)
-				err = queue.AcknowledgeCancellation(ctx, "job-cancelling-stopped", true)
+				err = queue.AcknowledgeCancellation(ctx, map[string]bool{"job-cancelling-stopped": true})
 				Expect(err).NotTo(HaveOccurred())
 
 				// Then: Job status should be stopped
@@ -389,7 +389,7 @@ var _ = Describe("Job Cancellation", func() {
 				Expect(err).NotTo(HaveOccurred())
 
 				// When: Cancellation is acknowledged (was not executing)
-				err = queue.AcknowledgeCancellation(ctx, "job-cancelling-unknown", false)
+				err = queue.AcknowledgeCancellation(ctx, map[string]bool{"job-cancelling-unknown": false})
 				Expect(err).NotTo(HaveOccurred())
 
 				// Then: Job status should be unknown
@@ -501,7 +501,7 @@ var _ = Describe("Job Cancellation", func() {
 				completedJobBefore, err := queue.GetJob(ctx, "job-completed")
 				Expect(err).NotTo(HaveOccurred())
 				Expect(completedJobBefore.Status).To(Equal(jobpool.JobStatusRunning))
-				err = queue.CompleteJob(ctx, "job-completed", []byte("result"))
+				err = queue.CompleteJobs(ctx, map[string][]byte{"job-completed": []byte("result")})
 				Expect(err).NotTo(HaveOccurred())
 
 				// When: Service restarts

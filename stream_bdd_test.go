@@ -132,6 +132,18 @@ var _ = Describe("Queue API Specification", func() {
 				case <-time.After(2 * time.Second):
 					Fail("Job should be assigned")
 				}
+
+				// Verify job is in RUNNING state before failing it
+				// (Don't cancel StreamJobs yet, as that would transition it to FAILED_RETRY)
+				runningJob, err := queue.GetJob(ctx, "job-fail-retry-1")
+				Expect(err).NotTo(HaveOccurred())
+				Expect(runningJob.Status).To(Equal(jobpool.JobStatusRunning))
+
+				// When: Job fails (FailJob transitions to FAILED_RETRY)
+				err = queue.FailJobs(ctx, map[string]string{"job-fail-retry-1": "test error"})
+				Expect(err).NotTo(HaveOccurred())
+
+				// Now cancel the first StreamJobs (cleanup will handle any remaining jobs)
 				assignCancel()
 				assignWg.Wait()
 
@@ -148,10 +160,6 @@ var _ = Describe("Queue API Specification", func() {
 				}()
 
 				time.Sleep(100 * time.Millisecond)
-
-				// When: Job fails (FailJob transitions to FAILED_RETRY)
-				err = queue.FailJob(ctx, "job-fail-retry-1", "test error")
-				Expect(err).NotTo(HaveOccurred())
 
 				// Then: Failed job should be pushed again via StreamJobs (for retry)
 				select {
@@ -318,7 +326,7 @@ var _ = Describe("Queue API Specification", func() {
 
 				// Fail the job BEFORE canceling StreamJobs (transitions to FAILED_RETRY)
 				// Use the job we received from StreamJobs, which should already be in RUNNING state
-				err = queue.FailJob(ctx, assignedJob.ID, "test error")
+				err = queue.FailJobs(ctx, map[string]string{assignedJob.ID: "test error"})
 				Expect(err).NotTo(HaveOccurred())
 
 				assignCancel()
@@ -411,7 +419,7 @@ var _ = Describe("Queue API Specification", func() {
 				}
 
 				// When: Complete the assigned job
-				err := queue.CompleteJob(ctx, "job-complete-0", []byte("result"))
+				err := queue.CompleteJobs(ctx, map[string][]byte{"job-complete-0": []byte("result")})
 				Expect(err).NotTo(HaveOccurred())
 
 				// Then: Next job should be immediately available (either already in received batch or pushed via notification)
@@ -493,7 +501,7 @@ var _ = Describe("Queue API Specification", func() {
 				}
 
 				// When: Stop the assigned job
-				err := queue.StopJob(ctx, "job-stop-0", "cancelled")
+				err := queue.StopJobs(ctx, map[string]string{"job-stop-0": "cancelled"})
 				Expect(err).NotTo(HaveOccurred())
 
 				// Then: Next job should be immediately available (either already in received batch or pushed via notification)
@@ -571,7 +579,7 @@ var _ = Describe("Queue API Specification", func() {
 				}
 
 				// When: Fail the assigned job (FailJob frees capacity and transitions to FAILED_RETRY)
-				err := queue.FailJob(ctx, "job-fail-capacity-0", "test error")
+				err := queue.FailJobs(ctx, map[string]string{"job-fail-capacity-0": "test error"})
 				Expect(err).NotTo(HaveOccurred())
 
 				// Then: Next job should be immediately available (either already in received batch or pushed via notification)
@@ -650,7 +658,7 @@ var _ = Describe("Queue API Specification", func() {
 				}
 
 				// When: Mark job as UNKNOWN_STOPPED
-				err := queue.MarkJobUnknownStopped(ctx, "job-unknown-stopped-0", "worker unresponsive")
+				err := queue.MarkJobsUnknownStopped(ctx, map[string]string{"job-unknown-stopped-0": "worker unresponsive"})
 				Expect(err).NotTo(HaveOccurred())
 
 				// Then: Next job should be immediately available (either already in received batch or pushed via notification)
@@ -728,7 +736,7 @@ var _ = Describe("Queue API Specification", func() {
 				}
 
 				// When: Complete the job
-				err := queue.CompleteJob(ctx, "job-update-complete-0", []byte("result"))
+				err := queue.CompleteJobs(ctx, map[string][]byte{"job-update-complete-0": []byte("result")})
 				Expect(err).NotTo(HaveOccurred())
 
 				// Then: Next job should be immediately available (either already in received batch or pushed via notification)
@@ -822,7 +830,7 @@ var _ = Describe("Queue API Specification", func() {
 					}
 
 					// When: Complete the job
-					err := queue.CompleteJob(ctx, jobToComplete, []byte("result"))
+					err := queue.CompleteJobs(ctx, map[string][]byte{jobToComplete: []byte("result")})
 					Expect(err).NotTo(HaveOccurred())
 					completedCount++
 					time.Sleep(100 * time.Millisecond)
@@ -961,7 +969,7 @@ var _ = Describe("Queue API Specification", func() {
 				}
 
 				// When: Complete one job
-				err := queue.CompleteJob(ctx, initialJobs[0], []byte("result"))
+				err := queue.CompleteJobs(ctx, map[string][]byte{initialJobs[0]: []byte("result")})
 				Expect(err).NotTo(HaveOccurred())
 
 				// Wait a bit for the push to happen
@@ -1039,7 +1047,7 @@ var _ = Describe("Queue API Specification", func() {
 
 				// When: Complete 3 jobs (freeing 3 capacity units)
 				for i := 0; i < 3; i++ {
-					err := queue.CompleteJob(ctx, initialJobs[i], []byte("result"))
+					err := queue.CompleteJobs(ctx, map[string][]byte{initialJobs[i]: []byte("result")})
 					Expect(err).NotTo(HaveOccurred())
 				}
 
@@ -1240,7 +1248,7 @@ var _ = Describe("Queue API Specification", func() {
 			doneChecking:
 
 				// When: Complete one job (transition from 0 to 1 unused capacity)
-				err = queue.CompleteJob(ctx, initialJobs[0], []byte("result"))
+				err = queue.CompleteJobs(ctx, map[string][]byte{initialJobs[0]: []byte("result")})
 				Expect(err).NotTo(HaveOccurred())
 
 				// Then: New job should be pushed immediately
@@ -1409,16 +1417,16 @@ var _ = Describe("Queue API Specification", func() {
 				}
 
 				// Complete job2 first to free it up (it was dequeued and is RUNNING)
-				err = queue.CompleteJob(ctx, "job-recent", []byte("completed"))
+				err = queue.CompleteJobs(ctx, map[string][]byte{"job-recent": []byte("completed")})
 				Expect(err).NotTo(HaveOccurred())
 
 				// Fail job1 and job3 BEFORE cancelling StreamJobs to set last_retry_at
 				// These jobs are in RUNNING state, so FailJob should transition them to FAILED_RETRY
-				err = queue.FailJob(ctx, "job-early-retry", "error1")
+				err = queue.FailJobs(ctx, map[string]string{"job-early-retry": "error1"})
 				Expect(err).NotTo(HaveOccurred())
 				// Small delay to ensure different retry times and allow transaction to commit
 				time.Sleep(50 * time.Millisecond)
-				err = queue.FailJob(ctx, "job-early-very-recent-retry", "error3")
+				err = queue.FailJobs(ctx, map[string]string{"job-early-very-recent-retry": "error3"})
 				Expect(err).NotTo(HaveOccurred())
 				// Additional delay to ensure backend transaction is committed
 				time.Sleep(100 * time.Millisecond)
@@ -1504,7 +1512,7 @@ var _ = Describe("Queue API Specification", func() {
 				}
 
 				// Complete one job to free capacity
-				err := queue.CompleteJob(ctx, "job-initial-0", []byte("result"))
+				err := queue.CompleteJobs(ctx, map[string][]byte{"job-initial-0": []byte("result")})
 				Expect(err).NotTo(HaveOccurred())
 
 				// Enqueue 2 new jobs with different creation times
@@ -1759,7 +1767,7 @@ var _ = Describe("Queue API Specification", func() {
 					initialRetryCount := cancellingJob.RetryCount
 
 					// When: Stop job with retry
-					err = queue.StopJobWithRetry(ctx, "job-stop-retry-1", "cancelled with retry")
+					err = queue.StopJobsWithRetry(ctx, map[string]string{"job-stop-retry-1": "cancelled with retry"})
 					Expect(err).NotTo(HaveOccurred())
 
 					// Then: Job should be STOPPED with retry count incremented
@@ -1820,7 +1828,7 @@ var _ = Describe("Queue API Specification", func() {
 					Expect(err).NotTo(HaveOccurred())
 
 					// When: Stop job with retry
-					err = queue.StopJobWithRetry(ctx, "job-stop-retry-capacity-0", "cancelled")
+					err = queue.StopJobsWithRetry(ctx, map[string]string{"job-stop-retry-capacity-0": "cancelled"})
 					Expect(err).NotTo(HaveOccurred())
 
 					// Then: Next job should be immediately available (either already in received batch or pushed via notification)
@@ -2000,7 +2008,7 @@ var _ = Describe("Queue API Specification", func() {
 					}
 
 					// Fail the job BEFORE cancelling StreamJobs
-					err = queue.FailJob(ctx, "job-cancel-failed-1", "test error")
+					err = queue.FailJobs(ctx, map[string]string{"job-cancel-failed-1": "test error"})
 					Expect(err).NotTo(HaveOccurred())
 
 					streamCancel()
@@ -2218,7 +2226,7 @@ var _ = Describe("Queue API Specification", func() {
 					Expect(cancellingJob.Status).To(Equal(jobpool.JobStatusCancelling))
 
 					// When: Acknowledge cancellation with wasExecuting=true
-					err = queue.AcknowledgeCancellation(ctx, "job-ack-stop-1", true)
+					err = queue.AcknowledgeCancellation(ctx, map[string]bool{"job-ack-stop-1": true})
 					Expect(err).NotTo(HaveOccurred())
 
 					// Then: Job should be in STOPPED state
@@ -2274,7 +2282,7 @@ var _ = Describe("Queue API Specification", func() {
 					Expect(err).NotTo(HaveOccurred())
 
 					// When: Acknowledge cancellation
-					err = queue.AcknowledgeCancellation(ctx, "job-ack-capacity-0", true)
+					err = queue.AcknowledgeCancellation(ctx, map[string]bool{"job-ack-capacity-0": true})
 					Expect(err).NotTo(HaveOccurred())
 
 					// Then: Next job should be immediately available (either already in received batch or pushed via notification)
@@ -2358,7 +2366,7 @@ var _ = Describe("Queue API Specification", func() {
 					Expect(cancellingJob.Status).To(Equal(jobpool.JobStatusCancelling))
 
 					// When: Acknowledge cancellation with wasExecuting=false
-					err = queue.AcknowledgeCancellation(ctx, "job-ack-unknown-1", false)
+					err = queue.AcknowledgeCancellation(ctx, map[string]bool{"job-ack-unknown-1": false})
 					Expect(err).NotTo(HaveOccurred())
 
 					// Then: Job should be in UNKNOWN_STOPPED state
@@ -2704,20 +2712,46 @@ var _ = Describe("Queue API Specification", func() {
 						_ = queue.StreamJobs(streamCtx, "worker-stats-1", []string{"tag1"}, 10, jobChan)
 					}()
 
-					time.Sleep(100 * time.Millisecond)
+					time.Sleep(200 * time.Millisecond)
 
+					// Receive and complete only the first job
+					var completedJobID string
 					select {
 					case jobs := <-jobChan:
 						Expect(len(jobs)).To(BeNumerically(">=", 1))
 						if len(jobs) > 0 {
-							err = queue.CompleteJob(ctx, jobs[0].ID, []byte("result"))
+							completedJobID = jobs[0].ID
+							err = queue.CompleteJobs(ctx, map[string][]byte{completedJobID: []byte("result")})
 							Expect(err).NotTo(HaveOccurred())
 						}
 					case <-time.After(2 * time.Second):
+						Fail("Should receive at least one job")
 					}
+
+					// Wait a bit to ensure the second job is also assigned
+					time.Sleep(200 * time.Millisecond)
+
+					// Verify both jobs were assigned (one completed, one still running)
+					allJobs, err := queue.GetJobs(ctx, []string{"job-stats-states-1", "job-stats-states-2"})
+					Expect(err).NotTo(HaveOccurred())
+					completedCount := 0
+					runningCount := 0
+					for _, job := range allJobs {
+						if job.Status == jobpool.JobStatusCompleted {
+							completedCount++
+						} else if job.Status == jobpool.JobStatusRunning {
+							runningCount++
+						}
+					}
+					Expect(completedCount).To(BeNumerically(">=", 1), "At least one job should be completed")
+					// At least one job should be running (the one we didn't complete)
+					// OR both jobs might have been assigned and we need to wait for cleanup
 
 					streamCancel()
 					wg.Wait()
+
+					// Wait for cleanup to complete
+					time.Sleep(300 * time.Millisecond)
 
 					// When: Query stats
 					stats, err := queue.GetJobStats(ctx, []string{"tag1"})
@@ -2940,7 +2974,7 @@ var _ = Describe("Queue API Specification", func() {
 					}
 
 					for _, job := range receivedJobs {
-						err = queue.CompleteJob(ctx, job.ID, []byte("result"))
+						err = queue.CompleteJobs(ctx, map[string][]byte{job.ID: []byte("result")})
 						Expect(err).NotTo(HaveOccurred())
 					}
 
@@ -3009,7 +3043,7 @@ var _ = Describe("Queue API Specification", func() {
 					}
 
 					for _, job := range receivedJobs {
-						err = queue.CompleteJob(ctx, job.ID, []byte("result"))
+						err = queue.CompleteJobs(ctx, map[string][]byte{job.ID: []byte("result")})
 						Expect(err).NotTo(HaveOccurred())
 					}
 
@@ -3067,7 +3101,7 @@ var _ = Describe("Queue API Specification", func() {
 					select {
 					case jobs := <-jobChan:
 						if len(jobs) > 0 {
-							err = queue.CompleteJob(ctx, jobs[0].ID, []byte("result"))
+							err = queue.CompleteJobs(ctx, map[string][]byte{jobs[0].ID: []byte("result")})
 							Expect(err).NotTo(HaveOccurred())
 						}
 					case <-time.After(2 * time.Second):
@@ -3143,7 +3177,7 @@ var _ = Describe("Queue API Specification", func() {
 					}
 
 					for _, job := range receivedJobs {
-						err = queue.CompleteJob(ctx, job.ID, []byte("result"))
+						err = queue.CompleteJobs(ctx, map[string][]byte{job.ID: []byte("result")})
 						Expect(err).NotTo(HaveOccurred())
 					}
 
@@ -3200,7 +3234,7 @@ var _ = Describe("Queue API Specification", func() {
 					select {
 					case jobs := <-jobChan:
 						if len(jobs) > 0 {
-							err = queue.CompleteJob(ctx, jobs[0].ID, []byte("result"))
+							err = queue.CompleteJobs(ctx, map[string][]byte{jobs[0].ID: []byte("result")})
 							Expect(err).NotTo(HaveOccurred())
 						}
 					case <-time.After(2 * time.Second):

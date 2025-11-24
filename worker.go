@@ -134,30 +134,42 @@ func (w *Worker) processBatch(ctx context.Context) {
 				// Channel closed by StreamJobs, it finished
 				return
 			}
-			for _, job := range jobs {
-				w.processJob(ctx, job)
-			}
+			w.processJobs(ctx, jobs)
 		}
 	}
 }
 
-// processJob processes a single job
-func (w *Worker) processJob(ctx context.Context, job *Job) {
-	// Job is already in RUNNING state (assigned by StreamJobs/DequeueJobs)
-	// Process the job
-	result, err := w.processor(ctx, job)
-	if err != nil {
-		// Job failed - FailJob handles FAILED_RETRY → INITIAL_PENDING transition with retry increment
-		if failErr := w.queue.FailJob(ctx, job.ID, err.Error()); failErr != nil {
-			w.logger.Error("Failed to mark job as failed", "jobID", job.ID, "error", failErr)
+// processJobs processes a batch of jobs
+func (w *Worker) processJobs(ctx context.Context, jobs []*Job) {
+	// Prepare batch operations
+	completeJobs := make(map[string][]byte)
+	failJobs := make(map[string]string)
+
+	// Process each job
+	for _, job := range jobs {
+		// Job is already in RUNNING state (assigned by StreamJobs/DequeueJobs)
+		// Process the job
+		result, err := w.processor(ctx, job)
+		if err != nil {
+			// Job failed - collect for batch FailJobs call
+			failJobs[job.ID] = err.Error()
+		} else {
+			// Job succeeded - collect for batch CompleteJobs call
+			completeJobs[job.ID] = result
 		}
-		return
 	}
 
-	// Job succeeded - update status to completed
-	if err := w.queue.CompleteJob(ctx, job.ID, result); err != nil {
-		w.logger.Error("Failed to mark job as completed", "jobID", job.ID, "error", err)
-		return
+	// Execute batch operations
+	if len(failJobs) > 0 {
+		if err := w.queue.FailJobs(ctx, failJobs); err != nil {
+			w.logger.Error("Failed to mark jobs as failed", "error", err, "count", len(failJobs))
+		}
+	}
+
+	if len(completeJobs) > 0 {
+		if err := w.queue.CompleteJobs(ctx, completeJobs); err != nil {
+			w.logger.Error("Failed to mark jobs as completed", "error", err, "count", len(completeJobs))
+		}
 	}
 }
 

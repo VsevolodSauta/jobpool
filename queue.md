@@ -96,22 +96,23 @@ type Queue interface {
     // Job streaming (push-based)
     StreamJobs(ctx context.Context, assigneeID string, tags []string, maxAssignedJobs int, ch chan<- []*Job) error
 
-    // Job lifecycle
-    CompleteJob(ctx context.Context, jobID string, result []byte) error
-    FailJob(ctx context.Context, jobID string, errorMsg string) error
-    StopJob(ctx context.Context, jobID string, errorMsg string) error
-    StopJobWithRetry(ctx context.Context, jobID string, errorMsg string) error
-    MarkJobUnknownStopped(ctx context.Context, jobID string, errorMsg string) error
+    // Job lifecycle (batch operations)
+    CompleteJobs(ctx context.Context, jobID2result map[string][]byte) error
+    FailJobs(ctx context.Context, jobID2errorMsg map[string]string) error
+    StopJobs(ctx context.Context, jobID2errorMsg map[string]string) error
+    StopJobsWithRetry(ctx context.Context, jobID2errorMsg map[string]string) error
+    MarkJobsUnknownStopped(ctx context.Context, jobID2errorMsg map[string]string) error
+    UpdateJobStatus(ctx context.Context, jobID string, status JobStatus, result []byte, errorMsg string) error
 
     // Cancellation
     CancelJobs(ctx context.Context, tags []string, jobIDs []string) ([]string, []string, error)
-    AcknowledgeCancellation(ctx context.Context, jobID string, wasExecuting bool) error
+    AcknowledgeCancellation(ctx context.Context, jobIDs2wasExecuting map[string]bool) error
 
     // Worker management
     MarkWorkerUnresponsive(ctx context.Context, assigneeID string) error
 
     // Query operations
-    GetJob(ctx context.Context, jobID string) (*Job, error)
+    GetJobs(ctx context.Context, jobIDs []string) ([]*Job, error)
     GetJobStats(ctx context.Context, tags []string) (*JobStats, error)
 
     // Maintenance
@@ -252,187 +253,253 @@ StreamJobs blocks until one of the following occurs:
 
 ### Job Lifecycle
 
-#### CompleteJob
+#### CompleteJobs
 
-**Signature**: `CompleteJob(ctx context.Context, jobID string, result []byte) error`
+**Signature**: `CompleteJobs(ctx context.Context, jobID2result map[string][]byte) error`
 
 **Preconditions**:
 - `ctx` is a valid context
-- `jobID` is non-empty
+- `jobID2result` is a map (may be empty)
 
 **Postconditions**:
-- If job exists and in valid state:
-  - Job status becomes `COMPLETED`
-  - `Result` field set to provided result
-  - `FinalizedAt` timestamp set
-  - `AssigneeID` and `AssignedAt` are preserved (not cleared) for historical tracking. To check if a job is currently assigned, check that `Status == RUNNING` rather than checking if `AssigneeID` is empty.
-  - Capacity freed for the StreamJobs call that had this job assigned (observable via StreamJobs receiving new jobs)
-  - Workers with matching tags notified
-- If job not found or invalid state:
-  - Returns error
+- If map is empty:
+  - Returns `nil` error (no-op)
+- For each job in map:
+  - If job exists and in valid state:
+    - Job status becomes `COMPLETED`
+    - `Result` field set to provided result
+    - `FinalizedAt` timestamp set
+    - `AssigneeID` and `AssignedAt` are preserved (not cleared) for historical tracking. To check if a job is currently assigned, check that `Status == RUNNING` rather than checking if `AssigneeID` is empty.
+    - Capacity freed for the StreamJobs call that had this job assigned
+  - If job not found or invalid state:
+    - Error is recorded (best-effort processing continues for other jobs)
+- After processing all jobs:
+  - All freed capacity is aggregated and workers are notified once
+  - Workers with matching tags notified (all workers notified if multiple tag combinations exist)
 
 **Observable Effects**:
-- Job will never ever be eligible for scheduling
-- Capacity increases for the StreamJobs call that had this job assigned
+- Jobs will never ever be eligible for scheduling
+- Capacity increases for StreamJobs calls that had these jobs assigned
 - Workers may receive new jobs via StreamJobs
 
-**Valid State Transitions**:
+**Valid State Transitions** (per job):
 - `RUNNING → COMPLETED`
 - `CANCELLING → COMPLETED`
-- `UNKNOWN_RETRY → COMPLETED` (if job is in UNKNOWN_RETRY state, CompleteJob transitions it to COMPLETED)
+- `UNKNOWN_RETRY → COMPLETED` (if job is in UNKNOWN_RETRY state, CompleteJobs transitions it to COMPLETED)
 - `UNKNOWN_STOPPED → COMPLETED` (UNKNOWN_* states may transition to any state as their actual state is unknown)
 
+**Batch Semantics**:
+- Empty map is valid and returns immediately (no-op)
+- Best-effort processing: all valid jobs are processed even if some fail
+- Partial failures: returns first error encountered, but all possible jobs are still processed
+- Capacity freeing: aggregated across all jobs before notifying workers
+- Notification: workers notified once after entire batch is processed (deduplicated tag combinations)
+
 **Backend Expectations**:
-- Must transition job to `COMPLETED` state atomically
-- Must store result bytes and set `FinalizedAt` timestamp
-- Must verify job exists and is in valid state before transition
+- Must transition each job to `COMPLETED` state atomically
+- Must store result bytes and set `FinalizedAt` timestamp for each job
+- Must verify each job exists and is in valid state before transition
 - Must preserve `AssigneeID` and `AssignedAt` for historical tracking
-- Must return error if job is in invalid state (terminal states)
+- Must return error if any job is in invalid state (but continue processing other jobs)
 
-#### FailJob
+#### FailJobs
 
-**Signature**: `FailJob(ctx context.Context, jobID string, errorMsg string) error`
+**Signature**: `FailJobs(ctx context.Context, jobID2errorMsg map[string]string) error`
 
 **Preconditions**:
 - `ctx` is a valid context
-- `jobID` is non-empty
-- `errorMsg` is non-empty
+- `jobID2errorMsg` is a map (may be empty)
+- All error messages in map are non-empty
 
 **Postconditions**:
-- If job exists and in valid state:
-  - Job status becomes `FAILED_RETRY`
-  - `ErrorMessage` field set
-  - `RetryCount` incremented by 1
-  - `LastRetryAt` timestamp set
-  - `AssigneeID` and `AssignedAt` are preserved (not cleared) for historical tracking. To check if a job is currently assigned, check that `Status == RUNNING` rather than checking if `AssigneeID` is empty.
-  - Capacity freed for the StreamJobs call that had this job assigned
-  - Workers with matching tags notified
-- If job not found or invalid state:
-  - Returns error
+- If map is empty:
+  - Returns `nil` error (no-op)
+- If any error message is empty:
+  - Returns error immediately (validation failure)
+- For each job in map:
+  - If job exists and in valid state:
+    - Job status becomes `FAILED_RETRY`
+    - `ErrorMessage` field set
+    - `RetryCount` incremented by 1
+    - `LastRetryAt` timestamp set
+    - `AssigneeID` and `AssignedAt` are preserved (not cleared) for historical tracking. To check if a job is currently assigned, check that `Status == RUNNING` rather than checking if `AssigneeID` is empty.
+    - Capacity freed for the StreamJobs call that had this job assigned
+  - If job not found or invalid state:
+    - Error is recorded (best-effort processing continues for other jobs)
+- After processing all jobs:
+  - All freed capacity is aggregated and workers are notified once
+  - Workers with matching tags notified (all workers notified if multiple tag combinations exist)
 
 **Observable Effects**:
-- Job becomes eligible for scheduling again (but remains in FAILED_RETRY state)
-- Capacity increases for the StreamJobs call that had this job assigned
-- Workers notified of eligible job
+- Jobs become eligible for scheduling again (but remain in FAILED_RETRY state)
+- Capacity increases for StreamJobs calls that had these jobs assigned
+- Workers notified of eligible jobs
 
-**Valid State Transitions**:
+**Valid State Transitions** (per job):
 - `RUNNING → FAILED_RETRY`
 - `UNKNOWN_RETRY → FAILED_RETRY`
 
-**Note**: CompleteJob and FailJob do not carry assigneeID parameter, so the Queue does not know (and does not care) which worker actually called these methods. If a job is in UNKNOWN_RETRY state and CompleteJob or FailJob is called, the job transitions to COMPLETED or FAILED_RETRY respectively.
+**Note**: CompleteJobs and FailJobs do not carry assigneeID parameter, so the Queue does not know (and does not care) which worker actually called these methods. If a job is in UNKNOWN_RETRY state and CompleteJobs or FailJobs is called, the job transitions to COMPLETED or FAILED_RETRY respectively.
+
+**Batch Semantics**:
+- Empty map is valid and returns immediately (no-op)
+- Validation: all error messages must be non-empty (returns error if any is empty)
+- Best-effort processing: all valid jobs are processed even if some fail
+- Partial failures: returns first error encountered, but all possible jobs are still processed
+- Capacity freeing: aggregated across all jobs before notifying workers
+- Notification: workers notified once after entire batch is processed (deduplicated tag combinations)
 
 **Backend Expectations**:
-- Must transition job to `FAILED_RETRY` state atomically
-- Must increment `RetryCount` by 1 and set `LastRetryAt` timestamp
-- Must store error message and set `CompletedAt` timestamp
-- Must verify job exists and is in valid state before transition
+- Must transition each job to `FAILED_RETRY` state atomically
+- Must increment `RetryCount` by 1 and set `LastRetryAt` timestamp for each job
+- Must store error message for each job
+- Must verify each job exists and is in valid state before transition
 - Must preserve `AssigneeID` and `AssignedAt` for historical tracking
-- Must return error if job is in invalid state (terminal states)
+- Must return error if any job is in invalid state (but continue processing other jobs)
 
-#### StopJob
+#### StopJobs
 
-**Signature**: `StopJob(ctx context.Context, jobID string, errorMsg string) error`
+**Signature**: `StopJobs(ctx context.Context, jobID2errorMsg map[string]string) error`
 
 **Preconditions**:
 - `ctx` is a valid context
-- `jobID` is non-empty
-- `errorMsg` is optional (may be empty string, unlike FailJob which requires non-empty errorMsg)
+- `jobID2errorMsg` is a map (may be empty)
+- `errorMsg` values are optional (may be empty string, unlike FailJobs which requires non-empty errorMsg)
 
 **Postconditions**:
-- If job exists and in valid state:
-  - Job status becomes `STOPPED`
-  - `ErrorMessage` field set (may be empty if errorMsg was empty)
-  - `FinalizedAt` timestamp set
-  - `AssigneeID` and `AssignedAt` are preserved (not cleared) for historical tracking. To check if a job is currently assigned, check that `Status == RUNNING` rather than checking if `AssigneeID` is empty.
-  - Capacity freed for the StreamJobs call that had this job assigned
-- If job not found or invalid state:
-  - Returns error
+- If map is empty:
+  - Returns `nil` error (no-op)
+- For each job in map:
+  - If job exists and in valid state:
+    - Job status becomes `STOPPED`
+    - `ErrorMessage` field set (may be empty if errorMsg was empty)
+    - `FinalizedAt` timestamp set
+    - `AssigneeID` and `AssignedAt` are preserved (not cleared) for historical tracking. To check if a job is currently assigned, check that `Status == RUNNING` rather than checking if `AssigneeID` is empty.
+    - Capacity freed for the StreamJobs call that had this job assigned
+  - If job not found or invalid state:
+    - Error is recorded (best-effort processing continues for other jobs)
+- After processing all jobs:
+  - All freed capacity is aggregated and workers are notified once
+  - Workers with matching tags notified (all workers notified if multiple tag combinations exist)
 
 **Observable Effects**:
-- Job no longer eligible for scheduling
-- Capacity increases for the StreamJobs call that had this job assigned
+- Jobs no longer eligible for scheduling
+- Capacity increases for StreamJobs calls that had these jobs assigned
 
-**Valid State Transitions**:
+**Valid State Transitions** (per job):
 - `RUNNING → STOPPED`
 - `CANCELLING → STOPPED`
 - `UNKNOWN_RETRY → STOPPED`
 
+**Batch Semantics**:
+- Empty map is valid and returns immediately (no-op)
+- Best-effort processing: all valid jobs are processed even if some fail
+- Partial failures: returns first error encountered, but all possible jobs are still processed
+- Capacity freeing: aggregated across all jobs before notifying workers
+- Notification: workers notified once after entire batch is processed (deduplicated tag combinations)
+
 **Backend Expectations**:
-- Must transition job to `STOPPED` state atomically
-- Must store error message (may be empty) and set `FinalizedAt` timestamp
-- Must verify job exists and is in valid state before transition
+- Must transition each job to `STOPPED` state atomically
+- Must store error message (may be empty) and set `FinalizedAt` timestamp for each job
+- Must verify each job exists and is in valid state before transition
 - Must preserve `AssigneeID` and `AssignedAt` for historical tracking
-- Must return error if job is in invalid state (already terminal)
+- Must return error if any job is in invalid state (but continue processing other jobs)
 
-#### StopJobWithRetry
+#### StopJobsWithRetry
 
-**Signature**: `StopJobWithRetry(ctx context.Context, jobID string, errorMsg string) error`
+**Signature**: `StopJobsWithRetry(ctx context.Context, jobID2errorMsg map[string]string) error`
 
 **Preconditions**:
 - `ctx` is a valid context
-- `jobID` is non-empty
-- Job is in `CANCELLING` state
+- `jobID2errorMsg` is a map (may be empty)
+- Jobs should be in `CANCELLING` state
 
 **Postconditions**:
-- If job exists and in `CANCELLING` state:
-  - Job status becomes `STOPPED`
-  - `ErrorMessage` field set
-  - `RetryCount` incremented by 1
-  - `LastRetryAt` timestamp set
-  - `FinalizedAt` timestamp set
-  - `AssigneeID` and `AssignedAt` are preserved (not cleared) for historical tracking. To check if a job is currently assigned, check that `Status == RUNNING` rather than checking if `AssigneeID` is empty.
-  - Capacity freed for the StreamJobs call that had this job assigned
-- If job not found or not in `CANCELLING` state:
-  - Returns error
+- If map is empty:
+  - Returns `nil` error (no-op)
+- For each job in map:
+  - If job exists and in `CANCELLING` state:
+    - Job status becomes `STOPPED`
+    - `ErrorMessage` field set
+    - `RetryCount` incremented by 1
+    - `LastRetryAt` timestamp set
+    - `FinalizedAt` timestamp set
+    - `AssigneeID` and `AssignedAt` are preserved (not cleared) for historical tracking. To check if a job is currently assigned, check that `Status == RUNNING` rather than checking if `AssigneeID` is empty.
+    - Capacity freed for the StreamJobs call that had this job assigned
+  - If job not found or not in `CANCELLING` state:
+    - Error is recorded (best-effort processing continues for other jobs)
+- After processing all jobs:
+  - All freed capacity is aggregated and workers are notified once
+  - Workers with matching tags notified (all workers notified if multiple tag combinations exist)
 
 **Observable Effects**:
-- Job no longer eligible for scheduling
-- Capacity increases for the StreamJobs call that had this job assigned
+- Jobs no longer eligible for scheduling
+- Capacity increases for StreamJobs calls that had these jobs assigned
 
-**Valid State Transitions**:
+**Valid State Transitions** (per job):
 - `CANCELLING → STOPPED` (with retry increment)
 
+**Batch Semantics**:
+- Empty map is valid and returns immediately (no-op)
+- Best-effort processing: all valid jobs are processed even if some fail
+- Partial failures: returns first error encountered, but all possible jobs are still processed
+- Capacity freeing: aggregated across all jobs before notifying workers
+- Notification: workers notified once after entire batch is processed (deduplicated tag combinations)
+
 **Backend Expectations**:
-- Must transition job from `CANCELLING` to `STOPPED` state atomically
-- Must increment `RetryCount` by 1 and set `LastRetryAt` timestamp (applies retry increment from transitory FAILED state)
-- Must store error message and set `FinalizedAt` timestamp
-- Must verify job is in `CANCELLING` state before transition
+- Must transition each job from `CANCELLING` to `STOPPED` state atomically
+- Must increment `RetryCount` by 1 and set `LastRetryAt` timestamp for each job (applies retry increment from transitory FAILED state)
+- Must store error message and set `FinalizedAt` timestamp for each job
+- Must verify each job is in `CANCELLING` state before transition
 - Must preserve `AssigneeID` and `AssignedAt` for historical tracking
-- Must return error if job is not in `CANCELLING` state
+- Must return error if any job is not in `CANCELLING` state (but continue processing other jobs)
 
-#### MarkJobUnknownStopped
+#### MarkJobsUnknownStopped
 
-**Signature**: `MarkJobUnknownStopped(ctx context.Context, jobID string, errorMsg string) error`
+**Signature**: `MarkJobsUnknownStopped(ctx context.Context, jobID2errorMsg map[string]string) error`
 
 **Preconditions**:
 - `ctx` is a valid context
-- `jobID` is non-empty
+- `jobID2errorMsg` is a map (may be empty)
 
 **Postconditions**:
-- If job exists:
-  - Job status becomes `UNKNOWN_STOPPED`
-  - `ErrorMessage` field set
-  - `FinalizedAt` timestamp set
-  - `AssigneeID` and `AssignedAt` are preserved (not cleared) for historical tracking. To check if a job is currently assigned, check that `Status == RUNNING` rather than checking if `AssigneeID` is empty.
-  - Capacity freed for the StreamJobs call that had this job assigned
-- If job not found:
-  - Returns error
+- If map is empty:
+  - Returns `nil` error (no-op)
+- For each job in map:
+  - If job exists:
+    - Job status becomes `UNKNOWN_STOPPED`
+    - `ErrorMessage` field set
+    - `FinalizedAt` timestamp set
+    - `AssigneeID` and `AssignedAt` are preserved (not cleared) for historical tracking. To check if a job is currently assigned, check that `Status == RUNNING` rather than checking if `AssigneeID` is empty.
+    - Capacity freed for the StreamJobs call that had this job assigned
+  - If job not found:
+    - Error is recorded (best-effort processing continues for other jobs)
+- After processing all jobs:
+  - All freed capacity is aggregated and workers are notified once
+  - Workers with matching tags notified (all workers notified if multiple tag combinations exist)
 
 **Observable Effects**:
-- Job no longer eligible for scheduling
-- Capacity increases for the StreamJobs call that had this job assigned
+- Jobs no longer eligible for scheduling
+- Capacity increases for StreamJobs calls that had these jobs assigned
 
-**Valid State Transitions**:
+**Valid State Transitions** (per job):
 - `CANCELLING → UNKNOWN_STOPPED`
 - `UNKNOWN_RETRY → UNKNOWN_STOPPED`
 - `RUNNING → UNKNOWN_STOPPED`
 
+**Batch Semantics**:
+- Empty map is valid and returns immediately (no-op)
+- Best-effort processing: all valid jobs are processed even if some fail
+- Partial failures: returns first error encountered, but all possible jobs are still processed
+- Capacity freeing: aggregated across all jobs before notifying workers
+- Notification: workers notified once after entire batch is processed (deduplicated tag combinations)
+
 **Backend Expectations**:
-- Must transition job to `UNKNOWN_STOPPED` state atomically
-- Must store error message and set `FinalizedAt` timestamp
-- Must verify job exists before transition
+- Must transition each job to `UNKNOWN_STOPPED` state atomically
+- Must store error message and set `FinalizedAt` timestamp for each job
+- Must verify each job exists before transition
 - Must preserve `AssigneeID` and `AssignedAt` for historical tracking
-- Must return error if job doesn't exist
+- Must return error if any job doesn't exist (but continue processing other jobs)
 
 ### Cancellation
 
@@ -470,35 +537,49 @@ StreamJobs blocks until one of the following occurs:
 
 #### AcknowledgeCancellation
 
-**Signature**: `AcknowledgeCancellation(ctx context.Context, jobID string, wasExecuting bool) error`
+**Signature**: `AcknowledgeCancellation(ctx context.Context, jobIDs2wasExecuting map[string]bool) error`
 
 **Preconditions**:
 - `ctx` is a valid context
-- `jobID` is non-empty
-- Job is in `CANCELLING` state
+- `jobIDs2wasExecuting` is a map (may be empty)
+- Jobs should be in `CANCELLING` state
 
 **Postconditions**:
-- If `wasExecuting = true`:
-  - Job status becomes `STOPPED`
-  - `FinalizedAt` timestamp set to current time (if not already set)
-  - Capacity is freed for the StreamJobs call that had this job assigned (job was actively executing when cancelled)
-- If `wasExecuting = false`:
-  - Job status becomes `UNKNOWN_STOPPED`
-  - `FinalizedAt` timestamp set to current time (if not already set)
-  - Capacity is not freed (job was not executing, so no capacity was held)
-- `AssigneeID` and `AssignedAt` are preserved (not cleared) for historical tracking
-- If job not found or not in `CANCELLING` state:
-  - Returns error
+- If map is empty:
+  - Returns `nil` error (no-op)
+- For each job in map:
+  - If job exists and in `CANCELLING` state:
+    - If `wasExecuting = true`:
+      - Job status becomes `STOPPED`
+      - `FinalizedAt` timestamp set to current time (if not already set)
+      - Capacity is freed for the StreamJobs call that had this job assigned (job was actively executing when cancelled)
+    - If `wasExecuting = false`:
+      - Job status becomes `UNKNOWN_STOPPED`
+      - `FinalizedAt` timestamp set to current time (if not already set)
+      - Capacity is not freed (job was not executing, so no capacity was held)
+    - `AssigneeID` and `AssignedAt` are preserved (not cleared) for historical tracking
+  - If job not found or not in `CANCELLING` state:
+    - Error is recorded (best-effort processing continues for other jobs)
+- After processing all jobs:
+  - All freed capacity is aggregated and workers are notified once
+  - Workers with matching tags notified (all workers notified if multiple tag combinations exist)
 
 **Observable Effects**:
-- Job transitions to terminal state
-- Capacity increases for the StreamJobs call that had this job assigned only if `wasExecuting=true` (job was actively executing when cancelled)
+- Jobs transition to terminal states
+- Capacity increases for StreamJobs calls that had these jobs assigned only if `wasExecuting=true` (jobs were actively executing when cancelled)
+
+**Batch Semantics**:
+- Empty map is valid and returns immediately (no-op)
+- Best-effort processing: all valid jobs are processed even if some fail
+- Partial failures: returns first error encountered, but all possible jobs are still processed
+- Capacity freeing: aggregated across all jobs (only for jobs where `wasExecuting=true`) before notifying workers
+- Notification: workers notified once after entire batch is processed (deduplicated tag combinations)
 
 **Backend Expectations**:
-- Must transition job from `CANCELLING` to `STOPPED` (if `wasExecuting=true`) or `UNKNOWN_STOPPED` (if `wasExecuting=false`) atomically
-- Must verify job is in `CANCELLING` state before transition
+- Must transition each job from `CANCELLING` to `STOPPED` (if `wasExecuting=true`) or `UNKNOWN_STOPPED` (if `wasExecuting=false`) atomically
+- Must verify each job is in `CANCELLING` state before transition
 - Must preserve `AssigneeID` and `AssignedAt` for historical tracking
-- Must return error if job is not in `CANCELLING` state
+- Must return error if any job is not in `CANCELLING` state (but continue processing other jobs)
 
 ### Worker Management
 
@@ -550,6 +631,33 @@ StreamJobs blocks until one of the following occurs:
 - Must return current state (read committed or stronger isolation)
 - Must return error if job doesn't exist
 - Must support efficient lookup by job ID
+
+#### GetJobs
+
+**Signature**: `GetJobs(ctx context.Context, jobIDs []string) ([]*Job, error)`
+
+**Preconditions**:
+- `ctx` is a valid context
+- `jobIDs` is a slice (may be empty)
+
+**Postconditions**:
+- If slice is empty:
+  - Returns empty slice and `nil` error (no-op)
+- Returns slice of jobs found (may be smaller than input if some jobs don't exist)
+- Best-effort: all existing jobs are returned even if some are not found
+- Returns first error encountered if any job lookup fails, but all found jobs are still returned
+- No observable side effects (read-only operation)
+
+**Batch Semantics**:
+- Empty slice is valid and returns immediately (no-op)
+- Best-effort processing: all existing jobs are returned even if some fail
+- Partial failures: returns first error encountered, but all found jobs are still returned
+
+**Backend Expectations**:
+- Must return complete job records with all fields populated for each found job
+- Must return current state (read committed or stronger isolation)
+- Must support efficient lookup by job IDs
+- Should be more efficient than multiple `GetJob` calls
 
 #### GetJobStats
 

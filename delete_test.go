@@ -61,7 +61,7 @@ var _ = Describe("DeleteJobs", func() {
 				Expect(err).NotTo(HaveOccurred())
 				_, err = backend.DequeueJobs(ctx, "worker-1", nil, 1)
 				Expect(err).NotTo(HaveOccurred())
-				err = queue.CompleteJob(ctx, "job-completed-1", []byte("result"))
+				err = queue.CompleteJobs(ctx, map[string][]byte{"job-completed-1": []byte("result")})
 				Expect(err).NotTo(HaveOccurred())
 
 				// When: DeleteJobs is called
@@ -119,7 +119,7 @@ var _ = Describe("DeleteJobs", func() {
 				Expect(err).NotTo(HaveOccurred())
 				_, err = backend.DequeueJobs(ctx, "worker-1", nil, 1)
 				Expect(err).NotTo(HaveOccurred())
-				err = queue.StopJob(ctx, "job-stopped-1", "stopped")
+				err = queue.StopJobs(ctx, map[string]string{"job-stopped-1": "stopped"})
 				Expect(err).NotTo(HaveOccurred())
 
 				// When: DeleteJobs is called
@@ -146,7 +146,7 @@ var _ = Describe("DeleteJobs", func() {
 				Expect(err).NotTo(HaveOccurred())
 				_, err = backend.DequeueJobs(ctx, "worker-1", nil, 1)
 				Expect(err).NotTo(HaveOccurred())
-				err = queue.MarkJobUnknownStopped(ctx, "job-unknown-stopped-1", "unknown")
+				err = queue.MarkJobsUnknownStopped(ctx, map[string]string{"job-unknown-stopped-1": "unknown"})
 				Expect(err).NotTo(HaveOccurred())
 
 				// When: DeleteJobs is called
@@ -174,7 +174,7 @@ var _ = Describe("DeleteJobs", func() {
 				Expect(err).NotTo(HaveOccurred())
 				_, err = backend.DequeueJobs(ctx, "worker-1", nil, 1)
 				Expect(err).NotTo(HaveOccurred())
-				err = queue.CompleteJob(ctx, "job-completed-multi", []byte("result"))
+				err = queue.CompleteJobs(ctx, map[string][]byte{"job-completed-multi": []byte("result")})
 				Expect(err).NotTo(HaveOccurred())
 
 				// Create unscheduled job
@@ -202,7 +202,7 @@ var _ = Describe("DeleteJobs", func() {
 				Expect(err).NotTo(HaveOccurred())
 				_, err = backend.DequeueJobs(ctx, "worker-2", nil, 1)
 				Expect(err).NotTo(HaveOccurred())
-				err = queue.StopJob(ctx, "job-stopped-multi", "stopped")
+				err = queue.StopJobs(ctx, map[string]string{"job-stopped-multi": "stopped"})
 				Expect(err).NotTo(HaveOccurred())
 
 				// When: DeleteJobs is called with all job IDs
@@ -291,7 +291,7 @@ var _ = Describe("DeleteJobs", func() {
 				Expect(err).NotTo(HaveOccurred())
 				_, err = backend.DequeueJobs(ctx, "worker-1", nil, 1)
 				Expect(err).NotTo(HaveOccurred())
-				err = queue.FailJob(ctx, "job-failed-1", "error")
+				err = queue.FailJobs(ctx, map[string]string{"job-failed-1": "error"})
 				Expect(err).NotTo(HaveOccurred())
 
 				// Job is now in INITIAL_PENDING state after FailJob
@@ -380,7 +380,7 @@ var _ = Describe("DeleteJobs", func() {
 				Expect(err).NotTo(HaveOccurred())
 				_, err = backend.DequeueJobs(ctx, "worker-1", nil, 1)
 				Expect(err).NotTo(HaveOccurred())
-				err = queue.CompleteJob(ctx, "job-completed-mixed", []byte("result"))
+				err = queue.CompleteJobs(ctx, map[string][]byte{"job-completed-mixed": []byte("result")})
 				Expect(err).NotTo(HaveOccurred())
 
 				pendingJob := &jobpool.Job{
@@ -428,7 +428,7 @@ var _ = Describe("DeleteJobs", func() {
 					Expect(err).NotTo(HaveOccurred())
 					_, err = backend.DequeueJobs(ctx, fmt.Sprintf("worker-%d", i), []string{"project-1"}, 1)
 					Expect(err).NotTo(HaveOccurred())
-					err = queue.CompleteJob(ctx, jobID, []byte("result"))
+					err = queue.CompleteJobs(ctx, map[string][]byte{jobID: []byte("result")})
 					Expect(err).NotTo(HaveOccurred())
 				}
 
@@ -460,7 +460,7 @@ var _ = Describe("DeleteJobs", func() {
 				Expect(err).NotTo(HaveOccurred())
 				_, err = backend.DequeueJobs(ctx, "worker-1", []string{"project-1", "service-1"}, 1)
 				Expect(err).NotTo(HaveOccurred())
-				err = queue.CompleteJob(ctx, "job-tag-both", []byte("result"))
+				err = queue.CompleteJobs(ctx, map[string][]byte{"job-tag-both": []byte("result")})
 				Expect(err).NotTo(HaveOccurred())
 
 				job2 := &jobpool.Job{
@@ -475,7 +475,7 @@ var _ = Describe("DeleteJobs", func() {
 				Expect(err).NotTo(HaveOccurred())
 				_, err = backend.DequeueJobs(ctx, "worker-2", []string{"project-1"}, 1)
 				Expect(err).NotTo(HaveOccurred())
-				err = queue.CompleteJob(ctx, "job-tag-project-only", []byte("result"))
+				err = queue.CompleteJobs(ctx, map[string][]byte{"job-tag-project-only": []byte("result")})
 				Expect(err).NotTo(HaveOccurred())
 
 				// When: DeleteJobs is called with both tags
@@ -508,7 +508,7 @@ var _ = Describe("DeleteJobs", func() {
 					Expect(err).NotTo(HaveOccurred())
 					_, err = backend.DequeueJobs(ctx, "worker-1", nil, 1)
 					Expect(err).NotTo(HaveOccurred())
-					err = queue.CompleteJob(ctx, jobID, []byte("result"))
+					err = queue.CompleteJobs(ctx, map[string][]byte{jobID: []byte("result")})
 					Expect(err).NotTo(HaveOccurred())
 				}
 
@@ -538,7 +538,7 @@ var _ = Describe("DeleteJobs", func() {
 				Expect(err).NotTo(HaveOccurred())
 				_, err = backend.DequeueJobs(ctx, "worker-1", nil, 1)
 				Expect(err).NotTo(HaveOccurred())
-				err = queue.CompleteJob(ctx, "job-exists", []byte("result"))
+				err = queue.CompleteJobs(ctx, map[string][]byte{"job-exists": []byte("result")})
 				Expect(err).NotTo(HaveOccurred())
 
 				// When: DeleteJobs is called with existing and non-existent job IDs
@@ -569,7 +569,7 @@ var _ = Describe("DeleteJobs", func() {
 				Expect(err).NotTo(HaveOccurred())
 				_, err = backend.DequeueJobs(ctx, "worker-1", []string{"project-1"}, 1)
 				Expect(err).NotTo(HaveOccurred())
-				err = queue.CompleteJob(ctx, "job-tagged", []byte("result"))
+				err = queue.CompleteJobs(ctx, map[string][]byte{"job-tagged": []byte("result")})
 				Expect(err).NotTo(HaveOccurred())
 
 				// Job with specific ID (no matching tag)
@@ -585,7 +585,7 @@ var _ = Describe("DeleteJobs", func() {
 				Expect(err).NotTo(HaveOccurred())
 				_, err = backend.DequeueJobs(ctx, "worker-2", []string{"project-2"}, 1)
 				Expect(err).NotTo(HaveOccurred())
-				err = queue.CompleteJob(ctx, "job-direct", []byte("result"))
+				err = queue.CompleteJobs(ctx, map[string][]byte{"job-direct": []byte("result")})
 				Expect(err).NotTo(HaveOccurred())
 
 				// When: DeleteJobs is called with both tags and job IDs

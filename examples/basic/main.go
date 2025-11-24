@@ -80,7 +80,7 @@ func main() {
 
 			// Process the job
 			result := []byte(`{"status": "completed"}`)
-			err = queue.CompleteJob(ctx, jobs[0].ID, result)
+			err = queue.CompleteJobs(ctx, map[string][]byte{jobs[0].ID: result})
 			if err != nil {
 				logger.Error("Failed to complete job", "error", err)
 				os.Exit(1)

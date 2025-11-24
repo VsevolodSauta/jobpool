@@ -701,7 +701,7 @@ var _ = Describe("Queue Interface", func() {
 				assignedAt := jobs[0].AssignedAt
 
 				// Complete job
-				err = queue.CompleteJob(ctx, "job-1", []byte("result"))
+				err = queue.CompleteJobs(ctx, map[string][]byte{"job-1": []byte("result")})
 				Expect(err).NotTo(HaveOccurred())
 
 				// Verify fields are preserved
@@ -730,7 +730,7 @@ var _ = Describe("Queue Interface", func() {
 				Expect(err).NotTo(HaveOccurred())
 
 				// Complete job
-				err = queue.CompleteJob(ctx, "job-1", []byte("result"))
+				err = queue.CompleteJobs(ctx, map[string][]byte{"job-1": []byte("result")})
 				Expect(err).NotTo(HaveOccurred())
 
 				// Verify FinalizedAt is set
@@ -759,7 +759,7 @@ var _ = Describe("Queue Interface", func() {
 				Expect(err).NotTo(HaveOccurred())
 
 				// Complete job (from CANCELLING state)
-				err = queue.CompleteJob(ctx, "job-1", []byte("result"))
+				err = queue.CompleteJobs(ctx, map[string][]byte{"job-1": []byte("result")})
 				Expect(err).NotTo(HaveOccurred())
 
 				// Verify job is completed
@@ -780,7 +780,7 @@ var _ = Describe("Queue Interface", func() {
 				Expect(err).NotTo(HaveOccurred())
 
 				// Complete job
-				err = queue.CompleteJob(ctx, "job-1", []byte("result"))
+				err = queue.CompleteJobs(ctx, map[string][]byte{"job-1": []byte("result")})
 				Expect(err).NotTo(HaveOccurred())
 
 				// Verify job is completed
@@ -801,7 +801,7 @@ var _ = Describe("Queue Interface", func() {
 				Expect(err).NotTo(HaveOccurred())
 
 				// Complete job
-				err = queue.CompleteJob(ctx, "job-1", []byte("result"))
+				err = queue.CompleteJobs(ctx, map[string][]byte{"job-1": []byte("result")})
 				Expect(err).NotTo(HaveOccurred())
 
 				// Verify job is completed
@@ -829,7 +829,7 @@ var _ = Describe("Queue Interface", func() {
 				Expect(len(jobs)).To(Equal(1))
 
 				// Complete job
-				err = queue.CompleteJob(ctx, "job-1", []byte("result"))
+				err = queue.CompleteJobs(ctx, map[string][]byte{"job-1": []byte("result")})
 				Expect(err).NotTo(HaveOccurred())
 
 				// Verify job is completed
@@ -877,7 +877,7 @@ var _ = Describe("Queue Interface", func() {
 				}
 
 				// Complete first job
-				err := queue.CompleteJob(ctx, firstJob.ID, []byte("result"))
+				err := queue.CompleteJobs(ctx, map[string][]byte{firstJob.ID: []byte("result")})
 				Expect(err).NotTo(HaveOccurred())
 
 				// Should receive second job (capacity freed)
@@ -915,7 +915,7 @@ var _ = Describe("Queue Interface", func() {
 				assignedAt := jobs[0].AssignedAt
 
 				// Fail job
-				err = queue.FailJob(ctx, "job-1", "test error")
+				err = queue.FailJobs(ctx, map[string]string{"job-1": "test error"})
 				Expect(err).NotTo(HaveOccurred())
 
 				// Verify fields are preserved
@@ -944,7 +944,7 @@ var _ = Describe("Queue Interface", func() {
 				Expect(err).NotTo(HaveOccurred())
 
 				// Fail job
-				err = queue.FailJob(ctx, "job-1", "test error")
+				err = queue.FailJobs(ctx, map[string]string{"job-1": "test error"})
 				Expect(err).NotTo(HaveOccurred())
 
 				// Verify retry count incremented and LastRetryAt set
@@ -966,7 +966,7 @@ var _ = Describe("Queue Interface", func() {
 				Expect(err).NotTo(HaveOccurred())
 
 				// Fail job
-				err = queue.FailJob(ctx, "job-1", "test error")
+				err = queue.FailJobs(ctx, map[string]string{"job-1": "test error"})
 				Expect(err).NotTo(HaveOccurred())
 
 				// Verify job is in FAILED_RETRY state
@@ -994,7 +994,7 @@ var _ = Describe("Queue Interface", func() {
 				Expect(len(jobs)).To(Equal(1))
 
 				// Fail job
-				err = queue.FailJob(ctx, "job-1", "test error")
+				err = queue.FailJobs(ctx, map[string]string{"job-1": "test error"})
 				Expect(err).NotTo(HaveOccurred())
 
 				// Verify job is failed
@@ -1006,7 +1006,7 @@ var _ = Describe("Queue Interface", func() {
 			})
 
 			It("should return error if errorMsg is empty", func() {
-				err := queue.FailJob(ctx, "job-1", "")
+				err := queue.FailJobs(ctx, map[string]string{"job-1": ""})
 				Expect(err).To(HaveOccurred())
 			})
 
@@ -1048,7 +1048,7 @@ var _ = Describe("Queue Interface", func() {
 				}
 
 				// Fail first job
-				err := queue.FailJob(ctx, firstJob.ID, "test error")
+				err := queue.FailJobs(ctx, map[string]string{firstJob.ID: "test error"})
 				Expect(err).NotTo(HaveOccurred())
 
 				// Should receive second job (capacity freed, failed job eligible again)
@@ -1086,7 +1086,7 @@ var _ = Describe("Queue Interface", func() {
 				assignedAt := jobs[0].AssignedAt
 
 				// Stop job
-				err = queue.StopJob(ctx, "job-1", "cancelled")
+				err = queue.StopJobs(ctx, map[string]string{"job-1": "cancelled"})
 				Expect(err).NotTo(HaveOccurred())
 
 				// Verify fields are preserved
@@ -1115,7 +1115,7 @@ var _ = Describe("Queue Interface", func() {
 				Expect(err).NotTo(HaveOccurred())
 
 				// Stop job
-				err = queue.StopJob(ctx, "job-1", "cancelled")
+				err = queue.StopJobs(ctx, map[string]string{"job-1": "cancelled"})
 				Expect(err).NotTo(HaveOccurred())
 
 				// Verify FinalizedAt is set
@@ -1144,7 +1144,7 @@ var _ = Describe("Queue Interface", func() {
 				Expect(err).NotTo(HaveOccurred())
 
 				// Stop job (from CANCELLING state)
-				err = queue.StopJob(ctx, "job-1", "cancelled")
+				err = queue.StopJobs(ctx, map[string]string{"job-1": "cancelled"})
 				Expect(err).NotTo(HaveOccurred())
 
 				// Verify job is stopped
@@ -1165,7 +1165,7 @@ var _ = Describe("Queue Interface", func() {
 				Expect(err).NotTo(HaveOccurred())
 
 				// Stop job
-				err = queue.StopJob(ctx, "job-1", "cancelled")
+				err = queue.StopJobs(ctx, map[string]string{"job-1": "cancelled"})
 				Expect(err).NotTo(HaveOccurred())
 
 				// Verify job is stopped
@@ -1193,7 +1193,7 @@ var _ = Describe("Queue Interface", func() {
 				Expect(len(jobs)).To(Equal(1))
 
 				// Stop job
-				err = queue.StopJob(ctx, "job-1", "cancelled")
+				err = queue.StopJobs(ctx, map[string]string{"job-1": "cancelled"})
 				Expect(err).NotTo(HaveOccurred())
 
 				// Verify job is stopped
@@ -1222,7 +1222,7 @@ var _ = Describe("Queue Interface", func() {
 				Expect(len(jobs)).To(Equal(1))
 
 				// Stop job with empty errorMsg
-				err = queue.StopJob(ctx, "job-1", "")
+				err = queue.StopJobs(ctx, map[string]string{"job-1": ""})
 				Expect(err).NotTo(HaveOccurred())
 			})
 		})
@@ -1241,7 +1241,7 @@ var _ = Describe("Queue Interface", func() {
 				Expect(err).NotTo(HaveOccurred())
 
 				// Try to stop with retry (not in CANCELLING state)
-				err = queue.StopJobWithRetry(ctx, "job-1", "error")
+				err = queue.StopJobsWithRetry(ctx, map[string]string{"job-1": "error"})
 				Expect(err).To(HaveOccurred())
 			})
 
@@ -1269,7 +1269,7 @@ var _ = Describe("Queue Interface", func() {
 				Expect(err).NotTo(HaveOccurred())
 
 				// Stop with retry
-				err = queue.StopJobWithRetry(ctx, "job-1", "cancelled with error")
+				err = queue.StopJobsWithRetry(ctx, map[string]string{"job-1": "cancelled with error"})
 				Expect(err).NotTo(HaveOccurred())
 
 				// Verify fields are preserved
@@ -1300,7 +1300,7 @@ var _ = Describe("Queue Interface", func() {
 				Expect(err).NotTo(HaveOccurred())
 
 				// Stop with retry
-				err = queue.StopJobWithRetry(ctx, "job-1", "cancelled with error")
+				err = queue.StopJobsWithRetry(ctx, map[string]string{"job-1": "cancelled with error"})
 				Expect(err).NotTo(HaveOccurred())
 
 				// Verify retry count incremented and LastRetryAt set
@@ -1334,7 +1334,7 @@ var _ = Describe("Queue Interface", func() {
 				Expect(err).NotTo(HaveOccurred())
 
 				// Stop with retry
-				err = queue.StopJobWithRetry(ctx, "job-1", "cancelled with error")
+				err = queue.StopJobsWithRetry(ctx, map[string]string{"job-1": "cancelled with error"})
 				Expect(err).NotTo(HaveOccurred())
 
 				// Verify job is stopped with retry count incremented
@@ -1367,7 +1367,7 @@ var _ = Describe("Queue Interface", func() {
 				assignedAt := jobs[0].AssignedAt
 
 				// Mark as unknown stopped
-				err = queue.MarkJobUnknownStopped(ctx, "job-1", "worker unresponsive")
+				err = queue.MarkJobsUnknownStopped(ctx, map[string]string{"job-1": "worker unresponsive"})
 				Expect(err).NotTo(HaveOccurred())
 
 				// Verify fields are preserved
@@ -1398,7 +1398,7 @@ var _ = Describe("Queue Interface", func() {
 				Expect(err).NotTo(HaveOccurred())
 
 				// Mark as unknown stopped
-				err = queue.MarkJobUnknownStopped(ctx, "job-1", "worker unresponsive")
+				err = queue.MarkJobsUnknownStopped(ctx, map[string]string{"job-1": "worker unresponsive"})
 				Expect(err).NotTo(HaveOccurred())
 
 				// Verify job is unknown stopped
@@ -1419,7 +1419,7 @@ var _ = Describe("Queue Interface", func() {
 				Expect(err).NotTo(HaveOccurred())
 
 				// Mark as unknown stopped
-				err = queue.MarkJobUnknownStopped(ctx, "job-1", "worker unresponsive")
+				err = queue.MarkJobsUnknownStopped(ctx, map[string]string{"job-1": "worker unresponsive"})
 				Expect(err).NotTo(HaveOccurred())
 
 				// Verify job is unknown stopped
@@ -1466,7 +1466,7 @@ var _ = Describe("Queue Interface", func() {
 				}
 
 				// Mark RUNNING job as unknown stopped (should free capacity)
-				err := queue.MarkJobUnknownStopped(ctx, firstJob.ID, "worker unresponsive")
+				err := queue.MarkJobsUnknownStopped(ctx, map[string]string{firstJob.ID: "worker unresponsive"})
 				Expect(err).NotTo(HaveOccurred())
 
 				// Should receive second job (capacity freed)
@@ -1499,7 +1499,7 @@ var _ = Describe("Queue Interface", func() {
 				Expect(err).NotTo(HaveOccurred())
 
 				// Mark as unknown stopped
-				err = queue.MarkJobUnknownStopped(ctx, "job-1", "worker unresponsive")
+				err = queue.MarkJobsUnknownStopped(ctx, map[string]string{"job-1": "worker unresponsive"})
 				Expect(err).NotTo(HaveOccurred())
 
 				// Verify job is unknown stopped
@@ -1527,7 +1527,7 @@ var _ = Describe("Queue Interface", func() {
 				Expect(len(jobs)).To(Equal(1))
 
 				// Mark as unknown stopped
-				err = queue.MarkJobUnknownStopped(ctx, "job-1", "worker unresponsive")
+				err = queue.MarkJobsUnknownStopped(ctx, map[string]string{"job-1": "worker unresponsive"})
 				Expect(err).NotTo(HaveOccurred())
 
 				// Verify job is unknown stopped
@@ -1637,7 +1637,7 @@ var _ = Describe("Queue Interface", func() {
 				// Assign and complete
 				_, err = backend.DequeueJobs(ctx, "worker-1", []string{"tag1"}, 1)
 				Expect(err).NotTo(HaveOccurred())
-				err = queue.CompleteJob(ctx, "job-1", []byte("result"))
+				err = queue.CompleteJobs(ctx, map[string][]byte{"job-1": []byte("result")})
 				Expect(err).NotTo(HaveOccurred())
 
 				// Try to cancel completed job
@@ -1732,12 +1732,12 @@ var _ = Describe("Queue Interface", func() {
 				Expect(err).NotTo(HaveOccurred())
 
 				// Try to acknowledge (not in CANCELLING state)
-				err = queue.AcknowledgeCancellation(ctx, "job-1", true)
+				err = queue.AcknowledgeCancellation(ctx, map[string]bool{"job-1": true})
 				Expect(err).To(HaveOccurred())
 			})
 
 			It("should return error if job not found", func() {
-				err := queue.AcknowledgeCancellation(ctx, "nonexistent", true)
+				err := queue.AcknowledgeCancellation(ctx, map[string]bool{"nonexistent": true})
 				Expect(err).To(HaveOccurred())
 			})
 
@@ -1781,7 +1781,7 @@ var _ = Describe("Queue Interface", func() {
 				// Cancel and acknowledge
 				_, _, err := queue.CancelJobs(ctx, nil, []string{firstJob.ID})
 				Expect(err).NotTo(HaveOccurred())
-				err = queue.AcknowledgeCancellation(ctx, firstJob.ID, true)
+				err = queue.AcknowledgeCancellation(ctx, map[string]bool{firstJob.ID: true})
 				Expect(err).NotTo(HaveOccurred())
 
 				// Should receive second job (capacity freed)
@@ -1815,7 +1815,7 @@ var _ = Describe("Queue Interface", func() {
 				Expect(err).NotTo(HaveOccurred())
 
 				// Acknowledge
-				err = queue.AcknowledgeCancellation(ctx, "job-1", true)
+				err = queue.AcknowledgeCancellation(ctx, map[string]bool{"job-1": true})
 				Expect(err).NotTo(HaveOccurred())
 
 				// Verify FinalizedAt is set
@@ -1843,7 +1843,7 @@ var _ = Describe("Queue Interface", func() {
 				Expect(err).NotTo(HaveOccurred())
 
 				// Acknowledge
-				err = queue.AcknowledgeCancellation(ctx, "job-1", true)
+				err = queue.AcknowledgeCancellation(ctx, map[string]bool{"job-1": true})
 				Expect(err).NotTo(HaveOccurred())
 
 				// Verify job is STOPPED
@@ -1871,7 +1871,7 @@ var _ = Describe("Queue Interface", func() {
 				Expect(err).NotTo(HaveOccurred())
 
 				// Acknowledge
-				err = queue.AcknowledgeCancellation(ctx, "job-1", false)
+				err = queue.AcknowledgeCancellation(ctx, map[string]bool{"job-1": false})
 				Expect(err).NotTo(HaveOccurred())
 
 				// Verify job is UNKNOWN_STOPPED
@@ -1920,7 +1920,7 @@ var _ = Describe("Queue Interface", func() {
 				// Cancel and acknowledge with wasExecuting=false (job was not executing, so no capacity held)
 				_, _, err := queue.CancelJobs(ctx, nil, []string{firstJob.ID})
 				Expect(err).NotTo(HaveOccurred())
-				err = queue.AcknowledgeCancellation(ctx, firstJob.ID, false)
+				err = queue.AcknowledgeCancellation(ctx, map[string]bool{firstJob.ID: false})
 				Expect(err).NotTo(HaveOccurred())
 
 				// Should NOT receive second job (capacity was not freed because job was not executing)
@@ -2144,7 +2144,7 @@ var _ = Describe("Queue Interface", func() {
 				Expect(len(dequeued)).To(Equal(1))
 
 				// Stop the dequeued job
-				err = queue.StopJob(ctx, dequeued[0].ID, "test stop")
+				err = queue.StopJobs(ctx, map[string]string{dequeued[0].ID: "test stop"})
 				Expect(err).NotTo(HaveOccurred())
 
 				stats, err := queue.GetJobStats(ctx, []string{"tag1"})
@@ -2287,7 +2287,7 @@ var _ = Describe("Queue Interface", func() {
 				// Assign and complete
 				_, err = backend.DequeueJobs(ctx, "worker-1", []string{"tag1"}, 1)
 				Expect(err).NotTo(HaveOccurred())
-				err = queue.CompleteJob(ctx, "job-1", []byte("result"))
+				err = queue.CompleteJobs(ctx, map[string][]byte{"job-1": []byte("result")})
 				Expect(err).NotTo(HaveOccurred())
 
 				// Cleanup with very short TTL
@@ -2468,7 +2468,7 @@ var _ = Describe("Queue Interface", func() {
 					if completedCount >= 1 {
 						break // Only complete one job
 					}
-					err := queue.CompleteJob(ctx, jobID, []byte("result"))
+					err := queue.CompleteJobs(ctx, map[string][]byte{jobID: []byte("result")})
 					Expect(err).NotTo(HaveOccurred())
 					completedCount++
 				}
@@ -2491,7 +2491,7 @@ var _ = Describe("Queue Interface", func() {
 							Expect(job.Status).To(Equal(jobpool.JobStatusRunning))
 							Expect(job.AssigneeID).To(Equal("new-worker"))
 							// Complete jobs as we receive them to free more capacity
-							err := queue.CompleteJob(ctx, job.ID, []byte("result"))
+							err := queue.CompleteJobs(ctx, map[string][]byte{job.ID: []byte("result")})
 							Expect(err).NotTo(HaveOccurred())
 						}
 					case <-timeout2:
@@ -2504,7 +2504,7 @@ var _ = Describe("Queue Interface", func() {
 					// Check if already completed
 					job, err := queue.GetJob(ctx, jobID)
 					if err == nil && job.Status != jobpool.JobStatusCompleted {
-						err := queue.CompleteJob(ctx, jobID, []byte("result"))
+						err := queue.CompleteJobs(ctx, map[string][]byte{jobID: []byte("result")})
 						Expect(err).NotTo(HaveOccurred())
 					}
 				}
@@ -2520,7 +2520,7 @@ var _ = Describe("Queue Interface", func() {
 							Expect(job.Status).To(Equal(jobpool.JobStatusRunning))
 							Expect(job.AssigneeID).To(Equal("new-worker"))
 							// Complete job to free more capacity
-							err := queue.CompleteJob(ctx, job.ID, []byte("result"))
+							err := queue.CompleteJobs(ctx, map[string][]byte{job.ID: []byte("result")})
 							Expect(err).NotTo(HaveOccurred())
 						}
 					case <-timeout3:
@@ -2560,7 +2560,7 @@ var _ = Describe("Queue Interface", func() {
 				for i := 0; i < 3; i++ {
 					_, err := backend.DequeueJobs(ctx, "worker-1", []string{"tag1"}, 1)
 					Expect(err).NotTo(HaveOccurred())
-					err = queue.CompleteJob(ctx, fmt.Sprintf("job-%d", i), []byte("result"))
+					err = queue.CompleteJobs(ctx, map[string][]byte{fmt.Sprintf("job-%d", i): []byte("result")})
 					Expect(err).NotTo(HaveOccurred())
 				}
 
@@ -2601,12 +2601,12 @@ var _ = Describe("Queue Interface", func() {
 				// Complete jobs
 				_, err = backend.DequeueJobs(ctx, "worker-1", []string{"tag1"}, 1)
 				Expect(err).NotTo(HaveOccurred())
-				err = queue.CompleteJob(ctx, "job-1", []byte("result"))
+				err = queue.CompleteJobs(ctx, map[string][]byte{"job-1": []byte("result")})
 				Expect(err).NotTo(HaveOccurred())
 
 				_, err = backend.DequeueJobs(ctx, "worker-1", []string{"tag2"}, 1)
 				Expect(err).NotTo(HaveOccurred())
-				err = queue.CompleteJob(ctx, "job-2", []byte("result"))
+				err = queue.CompleteJobs(ctx, map[string][]byte{"job-2": []byte("result")})
 				Expect(err).NotTo(HaveOccurred())
 
 				// Delete by tags (tag1) and jobIDs (job-2)
@@ -2636,7 +2636,7 @@ var _ = Describe("Queue Interface", func() {
 				// Assign and complete
 				_, err = backend.DequeueJobs(ctx, "worker-1", []string{"tag1"}, 1)
 				Expect(err).NotTo(HaveOccurred())
-				err = queue.CompleteJob(ctx, "job-1", []byte("result"))
+				err = queue.CompleteJobs(ctx, map[string][]byte{"job-1": []byte("result")})
 				Expect(err).NotTo(HaveOccurred())
 
 				// Delete job
@@ -2726,7 +2726,7 @@ var _ = Describe("Queue Interface", func() {
 				wg.Add(1)
 				go func(jobID string) {
 					defer wg.Done()
-					err := queue.CompleteJob(ctx, jobID, []byte("result"))
+					err := queue.CompleteJobs(ctx, map[string][]byte{jobID: []byte("result")})
 					Expect(err).NotTo(HaveOccurred())
 				}(fmt.Sprintf("job-%d", i))
 			}
